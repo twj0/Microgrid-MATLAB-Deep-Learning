@@ -1,0 +1,19 @@
+# mat文件
+*.mat
+
+# slxc文件
+*.slxc
+# results文件夹
+results/
+
+# archived文件夹,model-backup文件夹,project_docment文件夹
+archived/
+model-backup/
+project_document/
+prompt/ 
+todo/
+# 仿真后的agents和slprj
+matlab/ddpg/savedAgents/
+model/slprj/
+matlab/ddpg/slprj/
+

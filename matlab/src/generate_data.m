@@ -48,9 +48,9 @@ for day = 0:(simulation_days-1)
     weather_factor = max(0.2, min(1.0, weather_factor + cloud_noise));
     
     % 生成该天的24小时数据
-    for hour = 0:23
-        time_index = day * hours_per_day + hour + 1;
-        hour_of_day = hour;
+    for hour_idx = 0:23
+        time_index = day * hours_per_day + hour_idx + 1;
+        hour_of_day = hour_idx;
         
         % 日间时段 (6:00-18:00)
         if hour_of_day >= sunrise_hour && hour_of_day < sunset_hour
@@ -114,9 +114,9 @@ for day = 0:(simulation_days-1)
     end
     
     % 生成该天的24小时数据
-    for hour = 0:23
-        time_index = day * hours_per_day + hour + 1;
-        hour_of_day = hour;
+    for hour_idx = 0:23
+        time_index = day * hours_per_day + hour_idx + 1;
+        hour_of_day = hour_idx;
         
         % 基础负载曲线 (使用多个高斯分布叠加)
         % 早高峰 (8:00-11:00)
@@ -160,41 +160,64 @@ fprintf('  - 平均负载: %.2f kW\n', mean(load_power)/1000);
 fprintf('  - 峰值负载: %.2f kW\n', max(load_power)/1000);
 fprintf('  - 平均日用电量: %.2f kWh\n', mean(sum(reshape(load_power(1:simulation_days*24), 24, []), 1))/1000);
 
-%% 4. 分时电价曲线生成 (夏季E-TOU-C费率)
+%% 4. 分时电价曲线生成 (PG&E E-TOU 方案)
 % =========================================================================
 fprintf('\n正在生成分时电价曲线...\n');
 
-% 电价参数 ($/kWh) - PG&E夏季E-TOU-C费率 (普通用户Tier 1)
-price_off_peak = 0.39;  % 非高峰时段电价 (39¢/kWh)
-price_peak = 0.51;      % 高峰时段电价 (51¢/kWh)
+% 分时电价配置
+tou_plan = 'E-TOU-C';           % 可选: 'E-TOU-C', 'E-TOU-D'
+tier_level = 1;                 % 1 = 基础阶梯 (Below Baseline), 2 = 超基阶梯 (Above Baseline)
+simulation_start = datetime(2025, 7, 1, 0, 0, 0);  % 仿真起始时间 (可根据需要调整)
 
-% 高峰时段定义: 4 p.m. - 9 p.m. (16:00-21:00)
-peak_start_hour = 16;   % 高峰开始时间
-peak_end_hour = 21;     % 高峰结束时间
-
-% 初始化电价数组
+% 初始化电价数组与标注
 price_array = zeros(total_hours, 1);
+season_tags = cell(total_hours, 1);
 
-% 为每个小时分配电价
 for i = 1:total_hours
-    hour_of_day = mod(time_hours(i), 24);
+    current_time = simulation_start + hours(i-1);
+    hour_of_day = hour(current_time);
+    current_season = determine_season(current_time);
+    is_weekend = is_weekend_day(current_time);
     
-    % 判断是否在高峰时段 (4-9 PM)
-    if hour_of_day >= peak_start_hour && hour_of_day < peak_end_hour
-        price_array(i) = price_peak;      % 高峰时段
+    price_array(i) = compute_tou_price(hour_of_day, current_season, tier_level, tou_plan, is_weekend);
+    season_tags{i} = current_season;
+end
+
+% 汇总统计信息
+price_min = min(price_array);
+price_max = max(price_array);
+unique_prices = unique(price_array);
+unique_seasons = unique(season_tags);
+
+season_display = unique_seasons;
+for idx = 1:numel(season_display)
+    if strcmp(season_display{idx}, 'summer')
+        season_display{idx} = '夏季 (Summer)';
     else
-        price_array(i) = price_off_peak;  % 非高峰时段
+        season_display{idx} = '冬季 (Winter)';
     end
 end
 
-% 验证电价数据
-price_min = min(price_array);
-price_max = max(price_array);
+if strcmp(tou_plan, 'E-TOU-C')
+    peak_window_desc = '16:00-21:00 (每日)';
+elseif strcmp(tou_plan, 'E-TOU-D')
+    peak_window_desc = '17:00-20:00 (工作日)';
+else
+    peak_window_desc = '自定义';
+end
 
-fprintf('  - 费率方案: PG&E E-TOU-C (夏季, 普通用户)\n');
-fprintf('  - 高峰时段: %d:00 - %d:00\n', peak_start_hour, peak_end_hour);
-fprintf('  - 高峰电价: $%.3f/kWh (51¢/kWh)\n', price_peak);
-fprintf('  - 非高峰电价: $%.3f/kWh (39¢/kWh)\n', price_off_peak);
+if tier_level == 1
+    tier_desc = '基础阶梯 (Below Baseline)';
+else
+    tier_desc = '超基阶梯 (Above Baseline)';
+end
+
+fprintf('  - 费率方案: PG&E %s\n', tou_plan);
+fprintf('  - 阶梯等级: Tier %d (%s)\n', tier_level, tier_desc);
+fprintf('  - 仿真起始时间: %s\n', char(simulation_start));
+fprintf('  - 涉及季节: %s\n', strjoin(season_display, ', '));
+fprintf('  - 峰段时段: %s\n', peak_window_desc);
+fprintf('  - 价格水平数量: %d\n', numel(unique_prices));
 fprintf('  - 电价范围: $%.3f ~ $%.3f/kWh\n', price_min, price_max);
 
 %% 5. 电池特性查找表 (Look-up Tables)
@@ -312,7 +335,7 @@ load_power_profile.DataInfo.Units = 'W';
 price_data = price_array;  % 保存原始数组
 price_profile = timeseries(price_data, time_seconds);
 price_profile.Name = 'Electricity Price Profile';
-price_profile.DataInfo.Units = 'CNY/kWh';
+price_profile.DataInfo.Units = '$/kWh';
 
 fprintf('  - pv_power_profile: %d 个数据点\n', length(pv_power));
 fprintf('  - load_power_profile: %d 个数据点\n', length(load_power));
@@ -367,17 +390,16 @@ subplot(3,1,3);
 stairs(time_vis, price_data(1:vis_hours), 'k-', 'LineWidth', 1.5);
 xlabel('时间 (小时)');
 ylabel('电价 ($/kWh)');
-title(sprintf('PG&E E-TOU-C夏季分时电价曲线 (%d天)', vis_days));
+title(sprintf('PG&E %s 分时电价 (Tier %d, %d天)', tou_plan, tier_level, vis_days));
 grid on;
 xlim([0, vis_hours]);
-ylim([0, max(price_data)*1.2]);
+ylim([0, price_max*1.2]);
 
-% 添加高峰和非高峰时段标注
 hold on;
-yline(price_peak, '--r', sprintf('高峰时段(%d--%d PM) $%.3f/kWh', peak_start_hour-12, peak_end_hour-12), ...
+yline(price_max, '--r', sprintf('峰段 %s | $%.3f/kWh', peak_window_desc, price_max), ...
       'LineWidth', 1, 'LabelHorizontalAlignment', 'left');
-yline(price_off_peak, '--b', sprintf('非高峰时段 $%.3f/kWh', price_off_peak), ...
-      'LineWidth', 1, 'LabelHorizontalAlignment', 'right');
+yline(price_min, '--b', sprintf('最低电价 $%.3f/kWh', price_min), ...
+      'LineWidth', 1, 'LabelHorizontalAlignment', 'left');
 hold off;
 
 %% 9. 统计分析
@@ -415,9 +437,75 @@ for i = 1:total_hours
     end
 end
 fprintf('\n无储能情况下的电费估算:\n');
-fprintf('  - 总电费: %.2f 元 (%d天)\n', cost_no_storage, simulation_days);
-fprintf('  - 日均电费: %.2f 元/天\n', cost_no_storage/simulation_days);
+fprintf('  - 总电费: $%.2f (%d天)\n', cost_no_storage, simulation_days);
+fprintf('  - 日均电费: $%.2f/天\n', cost_no_storage/simulation_days);
 
 fprintf('\n=== 数据生成完成 ===\n');
 fprintf('变量已加载到工作区，可直接用于Simulink仿真。\n');
+
+%% 本地辅助函数
+function season = determine_season(dt)
+% determine_season 根据日期判断季节 (PG&E 方案: 6-9月为夏季)
+month_idx = month(dt);
+if month_idx >= 6 && month_idx <= 9
+    season = 'summer';
+else
+    season = 'winter';
+end
+end
+
+function tf = is_weekend_day(dt)
+% is_weekend_day 返回当前日期是否为周末 (周六或周日)
+day_idx = weekday(dt);  % MATLAB: 周日=1, 周六=7
+tf = (day_idx == 1) || (day_idx == 7);
+end
+
+function price = compute_tou_price(hour_of_day, season, tier, plan, is_weekend)
+% compute_tou_price 计算PG&E分时电价
+%   hour_of_day: 0-23小时
+%   season: 'summer' 或 'winter'
+%   tier: 1 (Below Baseline) / 2 (Above Baseline)
+%   plan: 'E-TOU-C' 或 'E-TOU-D'
+%   is_weekend: 逻辑值, 指示是否为周末
+
+hour_idx = mod(floor(hour_of_day), 24);
+season = lower(char(season));
+plan = upper(char(plan));
+
+if ~ismember(season, {'summer', 'winter'})
+    error('season must be ''summer'' or ''winter''.');
+end
+if ~ismember(tier, [1, 2])
+    error('tier must be 1 or 2.');
+end
+if nargin < 5
+    is_weekend = false;
+end
+
+switch plan
+    case 'E-TOU-C'
+        is_peak = (hour_idx >= 16) && (hour_idx < 21);  % 每日 4-9 PM
+        if strcmp(season, 'summer')
+            prices = [0.39, 0.49; 0.51, 0.61];
+        else
+            prices = [0.36, 0.46; 0.39, 0.49];
+        end
+    case 'E-TOU-D'
+        if is_weekend
+            is_peak = false;  % 周末按全时段非峰
+        else
+            is_peak = (hour_idx >= 17) && (hour_idx < 20);  % 工作日 5-8 PM
+        end
+        if strcmp(season, 'summer')
+            prices = [0.39, 0.43; 0.49, 0.56];
+        else
+            prices = [0.36, 0.43; 0.46, 0.47];
+        end
+    otherwise
+        error('Unsupported plan %s. Use ''E-TOU-C'' or ''E-TOU-D''.', plan);
+end
+
+row_idx = 1 + is_peak;  % 1: Off-peak, 2: Peak
+price = prices(row_idx, tier);
+end
 

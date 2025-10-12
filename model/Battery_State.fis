@@ -1,0 +1,95 @@
+[System]
+Name='Battery_State'
+Type='mamdani'
+Version=2.0
+NumInputs=3
+NumOutputs=1
+NumRules=42
+AndMethod='min'
+OrMethod='max'
+ImpMethod='min'
+AggMethod='max'
+DefuzzMethod='centroid'
+
+[Input1]
+Name='Price_Norm'
+Range=[0 1]
+NumMFs=2
+MF1='Low':'trapmf',[0 0 0.3 0.5]
+MF2='High':'trapmf',[0.5 0.7 1 1]
+
+[Input2]
+Name='SOC'
+Range=[0 100]
+NumMFs=3
+MF1='Low':'trapmf',[0 0 20 40]
+MF2='Medium':'trimf',[30 50 70]
+MF3='High':'trapmf',[60 80 100 100]
+
+[Input3]
+Name='SOC_Difference'
+Range=[-100 100]
+NumMFs=7
+MF1='VeryFastDecrease':'trapmf',[-100 -100 -60 -40]
+MF2='FastDecrease':'trapmf',[-50 -30 -15 -5]
+MF3='SlowDecrease':'trimf',[-10 -5 0]
+MF4='Stable':'trimf',[-2 0 2]
+MF5='SlowIncrease':'trimf',[0 5 10]
+MF6='FastIncrease':'trapmf',[5 15 30 50]
+MF7='VeryFastIncrease':'trapmf',[40 60 100 100]
+
+[Output1]
+Name='Reward_Signal'
+Range=[-1 1]
+NumMFs=7
+MF1='StrongNegative':'trimf',[-1 -1 -0.8]
+MF2='Negative':'trimf',[-0.9 -0.5 -0.2]
+MF3='SlightlyNegative':'trimf',[-0.3 -0.1 0]
+MF4='Neutral':'trimf',[-0.1 0 0.1]
+MF5='SlightlyPositive':'trimf',[0 0.1 0.3]
+MF6='Positive':'trimf',[0.2 0.5 0.9]
+MF7='StrongPositive':'trimf',[0.8 1 1]
+
+[Rules]
+1 1 1, 7 (1) : 1
+1 1 2, 6 (1) : 1
+1 1 3, 5 (1) : 1
+1 1 4, 4 (1) : 1
+1 1 5, 6 (1) : 1
+1 1 6, 7 (1) : 1
+1 1 7, 7 (1) : 1
+1 2 1, 6 (1) : 1
+1 2 2, 5 (1) : 1
+1 2 3, 4 (1) : 1
+1 2 4, 5 (1) : 1
+1 2 5, 6 (1) : 1
+1 2 6, 7 (1) : 1
+1 2 7, 7 (1) : 1
+1 3 1, 5 (1) : 1
+1 3 2, 4 (1) : 1
+1 3 3, 3 (1) : 1
+1 3 4, 4 (1) : 1
+1 3 5, 5 (1) : 1
+1 3 6, 6 (1) : 1
+1 3 7, 6 (1) : 1
+2 1 1, 2 (1) : 1
+2 1 2, 3 (1) : 1
+2 1 3, 4 (1) : 1
+2 1 4, 5 (1) : 1
+2 1 5, 4 (1) : 1
+2 1 6, 3 (1) : 1
+2 1 7, 2 (1) : 1
+2 2 1, 3 (1) : 1
+2 2 2, 4 (1) : 1
+2 2 3, 5 (1) : 1
+2 2 4, 6 (1) : 1
+2 2 5, 5 (1) : 1
+2 2 6, 4 (1) : 1
+2 2 7, 3 (1) : 1
+2 3 1, 4 (1) : 1
+2 3 2, 5 (1) : 1
+2 3 3, 6 (1) : 1
+2 3 4, 7 (1) : 1
+2 3 5, 6 (1) : 1
+2 3 6, 5 (1) : 1
+2 3 7, 4 (1) : 1

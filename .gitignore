@@ -1,6 +1,7 @@
 # mat文件
 *.mat
-
+# autosave文件
+.autosave
 # slxc文件
 *.slxc
 # results文件夹
@@ -16,4 +17,15 @@ todo/
 matlab/ddpg/savedAgents/
 model/slprj/
 matlab/ddpg/slprj/
-
+slprj/
+# matlab文件夹中的backup文件夹
+matlab/ddpg/backup/
+matlab/ddpg/model_backup/
+matlab/ddpg/results/
+# matlab文件夹中的一些备份文件
+matlab/ddpg/*.m.backup
+warp.md
+matlab/ddpg/main.m.backup
+matlab/ddpg/train_model.m.backup
+matlab/ddpg/MERGE_SUMMARY.md
+model/Microgrid.slx.autosave

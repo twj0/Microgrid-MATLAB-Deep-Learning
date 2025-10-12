@@ -1,421 +1,495 @@
-﻿%% 微电网DDPG强化学习 - 主程序
+﻿%% 微电网DDPG强化学习 - 统一主程序
 % =========================================================================
 % 功能: 训练DDPG智能体优化微电网储能调度
-% 模型: Microgrid.slx
+% 特色: 合并main.m和main_simplified.m的所有优点
 % 算法: Deep Deterministic Policy Gradient (DDPG)
+% 版本: 统一增强版 v3.0
 % =========================================================================
 
-clc; clear; close all;
-
-fprintf('========================================\n');
-fprintf('  微电网DDPG强化学习训练系统\n');
-fprintf('========================================\n');
-fprintf('启动时间: %s\n', datestr(now, 'yyyy-mm-dd HH:MM:SS'));
-fprintf('========================================\n\n');
-
-%% 1. 加载仿真数据
-% =========================================================================
-fprintf('=== 步骤1: 加载仿真数据 ===\n');
-
-% 数据文件路径
-data_path = fullfile('..', 'src', 'microgrid_simulation_data.mat');
-
-if ~exist(data_path, 'file')
-    error('数据文件不存在: %s\n请先运行 matlab/src/generate_data.m', data_path);
-end
-
-% 加载数据
-load(data_path);
-fprintf('✓ 数据加载成功\n');
-
-% 兼容旧版数据: 确保 price_profile 存在且为 timeseries
-price_reconstructed = false;
-if ~exist('price_profile', 'var') || isempty(price_profile)
-    if exist('price_data', 'var') && ~isempty(price_data)
-        price_profile = price_data;
-        price_reconstructed = true;
-    else
-        error(['数据缺失: 未找到 price_profile 或 price_data。' ...
-               '请重新运行 matlab/src/generate_data.m 生成完整数据。']);
+function main(training_mode)
+    % 输入参数:
+    %   training_mode - 可选，训练模式选择
+    %     'auto'     - 自动选择最佳训练方法 (默认)
+    %     'advanced' - 使用高级训练方法  
+    %     'simple'   - 使用兼容训练方法
+    %     'legacy'   - 使用原始训练方法
+    
+    if nargin < 1
+        training_mode = 'auto';
     end
-end
-
-if isa(price_profile, 'timeseries')
-    % 若时间向量缺失, 使用已知时间基准补全
-    if isempty(price_profile.Time) && exist('time_seconds', 'var')
-        sample_count = getTimeseriesSampleCount(price_profile);
-        if sample_count == numel(time_seconds)
-            price_profile.Time = time_seconds(:);
-        end
-    end
-elseif isnumeric(price_profile)
-    % 将数值数组转换为timeseries
-    if exist('time_seconds', 'var') && numel(time_seconds) == numel(price_profile)
-        time_vector = time_seconds(:);
-    else
-        if exist('dt', 'var') && isnumeric(dt) && isscalar(dt)
-            dt_seconds = double(dt);
-        else
-            dt_seconds = 3600;  % 默认1小时步长
-        end
-        time_vector = (0:numel(price_profile)-1)' * dt_seconds;
-    end
-    price_profile = timeseries(price_profile(:), time_vector);
-    price_reconstructed = true;
-else
-    error('数据格式错误: 无法识别 price_profile 类型 %s', class(price_profile));
-end
-
-if price_reconstructed
-    price_profile.Name = 'Electricity Price Profile';
-    price_profile.DataInfo.Units = 'CNY/kWh';
-    fprintf('  - 已自动重建电价时间序列 (price_profile)\n');
-end
-
-% 检查数据格式和长度
-if ~isa(pv_power_profile, 'timeseries') || ~isa(load_power_profile, 'timeseries')
-    error('数据格式错误: pv_power_profile 不是 timeseries 对象');
-end
-
-pv_hours = getTimeseriesDurationHours(pv_power_profile);
-load_hours = getTimeseriesDurationHours(load_power_profile);
-price_hours = getTimeseriesDurationHours(price_profile);
-
-fprintf('  - 光伏数据: %.0f 小时\n', pv_hours);
-fprintf('  - 负载数据: %.0f 小时\n', load_hours);
-fprintf('  - 电价数据: %.0f 小时\n', price_hours);
-
-if exist('OCV_LUT', 'var') && exist('R_int_LUT', 'var')
-    fprintf('  - 电池查找表: OCV_LUT, R_int_LUT\n');
-else
-    fprintf('  - 警告: 电池查找表不存在，请重新生成数据\n');
-end
-
-% 检查数据长度
-if pv_hours < 700
-    fprintf('\n⚠️  警告: 数据长度不足！\n');
-    fprintf('  当前数据: %.0f 小时\n', pv_hours);
-    fprintf('  期望数据: 720 小时 (30天)\n');
-    fprintf('  请运行以下命令重新生成数据:\n');
-    fprintf('    cd matlab/src\n');
-    fprintf('    run(''generate_data.m'')\n\n');
-    error('数据长度不足，无法继续训练');
-end
-
-agentVarName = '';
-
-%% 2. 配置Simulink模型
-% =========================================================================
-fprintf('\n=== 步骤2: 配置Simulink模型 ===\n');
-
-model_name = 'Microgrid';
-model_dir = fullfile('..', '..', 'model');
-model_path = fullfile(model_dir, [model_name '.slx']);
-
-if exist(model_dir, 'dir')
-    pathFolders = strsplit(path, pathsep);
-    if ~any(strcmpi(pathFolders, model_dir))
-        addpath(model_dir);
-        fprintf('✓ 已添加模型目录到路径: %s\n', model_dir);
-    end
-else
-    warning('模型目录不存在: %s', model_dir);
-end
-
-fis_file = fullfile(model_dir, 'Economic_Reward.fis');
-if ~exist(fis_file, 'file')
-    warning('未找到经济奖励FIS文件: %s', fis_file);
-else
-    fprintf('✓ 已检测到电价模糊规则文件: %s\n', fis_file);
-end
-
-if ~exist(model_path, 'file')
-    error('模型文件不存在: %s', model_path);
-end
-
-% 加载模型
-if ~bdIsLoaded(model_name)
-    load_system(model_path);
-    fprintf('✓ 模型已加载: %s\n', model_name);
-else
-    fprintf('✓ 模型已在内存中: %s\n', model_name);
-end
-
-% 设置仿真参数
-simulation_days = 30;  % 训练周期30天
-simulation_time = simulation_days * 24 * 3600;  % 秒
-set_param(model_name, 'StopTime', num2str(simulation_time));
-
-fprintf('✓ 仿真配置完成\n');
-fprintf('  - 仿真时长: %d 天\n', simulation_days);
-fprintf('  - 总秒数: %d 秒\n', simulation_time);
-
-%% 3. 定义RL环境
-% =========================================================================
-fprintf('\n=== 步骤3: 定义强化学习环境 ===\n');
-
-% 观测空间定义
-numObservations = 9;  % [Battery_SOC, P_pv, P_load_in, price_profile, P_net_load, P_batt, P_grid, reward, time_of_day]
-obsInfo = rlNumericSpec([numObservations 1]);
-obsInfo.Name = 'Microgrid Observations';
-obsInfo.Description = ['Battery_SOC, PV power, Load power, Electricity price, Net load, ', ...
-    'Battery power, Grid power, reward, time of day'];
-
-fprintf('✓ 观测空间: %d 维\n', numObservations);
-fprintf('  [Battery_SOC, P_pv, P_load_in, Price, P_net_load, P_batt, P_grid, reward, time_of_day]\n');
-
-% 动作空间定义
-numActions = 1;  % 电池充放电功率
-actInfo = rlNumericSpec([numActions 1]);
-actInfo.Name = 'Battery Power';
-actInfo.LowerLimit = -10e3;  % -10kW (放电)
-actInfo.UpperLimit = 10e3;   % +10kW (充电)
-
-fprintf('✓ 动作空间: %d 维\n', numActions);
-fprintf('  电池功率范围: %.1f kW ~ %.1f kW\n', ...
-    actInfo.LowerLimit/1000, actInfo.UpperLimit/1000);
-
-% 创建Simulink环境
-agentBlk = [model_name '/RL Agent'];
-agentVarName = ensureAgentWorkspaceVariable(agentBlk, obsInfo, actInfo);
-env = rlSimulinkEnv(model_name, agentBlk, obsInfo, actInfo);
-env.ResetFcn = @(in) localResetFcn(in);
-
-fprintf('✓ RL环境创建成功\n');
-fprintf('  - Agent模块: %s\n', agentBlk);
-
-%% 4. 训练DDPG智能体
-% =========================================================================
-fprintf('\n=== 步骤4: 开始DDPG训练 ===\n');
-
-try
-    % 调用训练函数
-    initialAgent = [];
-    if ~isempty(agentVarName)
+    
+    clc;
+    close all;
+    
+    fprintf('========================================\n');
+    fprintf('  微电网DDPG强化学习训练系统 v3.0\n');
+    fprintf('========================================\n');
+    start_time = datetime("now", "Format", "yyyy-MM-dd HH:mm:ss");
+    fprintf('启动时间: %s\n', char(start_time));
+    fprintf('训练模式: %s\n', upper(training_mode));
+    fprintf('========================================\n\n');
+    
+    try
+        %% 1. 环境初始化
+        fprintf('=== 步骤1: 环境初始化 ===\n');
+        config = initialize_environment();
+        fprintf('✓ 环境初始化完成\n');
+        
+        %% 1.5. 加载模糊逻辑系统
         try
-            initialAgent = evalin('base', agentVarName);
-        catch
-            initialAgent = [];
+            load_fuzzy_logic_files();
+            fprintf('✓ 模糊逻辑系统加载完成\n');
+        catch ME
+            fprintf('⚠ 模糊逻辑系统加载失败: %s\n', ME.message);
+            fprintf('  程序将继续运行，但可能影响Simulink模型\n');
         end
+        
+        %% 2. 数据加载与验证
+        fprintf('\n=== 步骤2: 数据加载与验证 ===\n');
+        data = load_and_validate_data(config);
+        fprintf('✓ 数据加载完成 (%.0f小时)\n', data.duration_hours);
+        
+        %% 3. Simulink环境配置
+        fprintf('\n=== 步骤3: Simulink环境配置 ===\n');
+        [env, agent_var_name] = setup_simulink_environment(config, data);
+        fprintf('✓ Simulink环境配置完成\n');
+        
+        %% 4. 智能体训练
+        fprintf('\n=== 步骤4: 开始DDPG训练 ===\n');
+        fprintf('训练模式: %s\n', training_mode);
+        
+        % 获取初始智能体（如果存在）
+        initial_agent = [];
+        if ~isempty(agent_var_name)
+            try
+                initial_agent = evalin('base', agent_var_name);
+            catch
+                initial_agent = [];
+            end
+        end
+        
+        tic;
+        [agent, results] = execute_training(env, initial_agent, training_mode, config);
+        training_time = toc;
+        
+        fprintf('✓ 训练完成 (%.1f分钟)\n', training_time/60);
+        
+        %% 5. 保存结果
+        fprintf('\n=== 步骤5: 保存训练结果 ===\n');
+        save_results(agent, results, config, training_mode, agent_var_name);
+        fprintf('✓ 结果保存完成\n');
+        
+        %% 6. 最终验证
+        fprintf('\n=== 步骤6: 最终验证 ===\n');
+        verify_final_performance(agent, env);
+        
+    catch ME
+        fprintf('\n✗ 错误: %s\n', ME.message);
+        if ~isempty(ME.stack)
+            fprintf('位置: %s (第%d行)\n', ME.stack(1).name, ME.stack(1).line);
+        end
+        rethrow(ME);
     end
-    [agent, training_results] = train_model(env, initialAgent);
-    if ~isempty(agentVarName)
-        assignin('base', agentVarName, agent);
-        fprintf('  - 已更新工作区变量: %s (训练后的智能体)\n', agentVarName);
-    end
     
-    fprintf('\n✓ 训练完成!\n');
-    fprintf('  - 总回合数: %d\n', training_results.total_episodes);
-    fprintf('  - 训练时长: %.2f 分钟\n', training_results.training_time/60);
-    
-    %% 5. 保存结果
-    % =====================================================================
-    fprintf('\n=== 步骤5: 保存训练结果 ===\n');
-    
-    timestamp = datestr(now, 'yyyymmdd_HHMMSS');
-    save_filename = sprintf('ddpg_agent_%s.mat', timestamp);
-    save(save_filename, 'agent', 'training_results');
-    
-    fprintf('✓ 智能体已保存: %s\n', save_filename);
-    
-catch ME
-    fprintf('\n✗ 训练失败: %s\n', ME.message);
-    fprintf('错误位置: %s (line %d)\n', ME.stack(1).name, ME.stack(1).line);
-    rethrow(ME);
+    fprintf('\n========================================\n');
+    fprintf('  训练流程全部完成！\n');
+    fprintf('========================================\n');
 end
 
-fprintf('\n========================================\n');
-fprintf('  训练流程完成\n');
-fprintf('========================================\n');
+%% 1. 环境初始化
+function config = initialize_environment()
+    % 路径配置
+    project_root = fileparts(fileparts(pwd));
+    model_dir = fullfile(project_root, 'model');
+    
+    % 添加关键路径
+    addpath(genpath(project_root));
+    addpath(model_dir);
+    
+    % 配置参数
+    config.model_name = 'Microgrid';
+    config.model_path = fullfile(model_dir, [config.model_name '.slx']);
+    config.data_path = fullfile(project_root, 'matlab', 'src', 'microgrid_simulation_data.mat');
+    config.simulation_days = 30;
+    config.simulation_time = config.simulation_days * 24 * 3600;
+    config.model_dir = model_dir;
+    
+    % 文件存在性检查
+    if ~exist(config.model_path, 'file')
+        error('Simulink模型不存在: %s', config.model_path);
+    end
+    if ~exist(config.data_path, 'file')
+        error('数据文件不存在: %s\n请先运行 matlab/src/generate_data.m', config.data_path);
+    end
+end
+
+%% 2. 数据加载与验证（增强版）
+function data = load_and_validate_data(config)
+    fprintf('正在加载仿真数据...\n');
+    raw_data = load(config.data_path);
+    
+    % 数据兼容性处理
+    required_vars = {'pv_power_profile', 'load_power_profile'};
+    for i = 1:length(required_vars)
+        var_name = required_vars{i};
+        if ~isfield(raw_data, var_name)
+            error('缺少必要数据: %s', var_name);
+        end
+    end
+    
+    % 电价数据处理（兼容多种格式）
+    if isfield(raw_data, 'price_profile')
+        data.price_profile = raw_data.price_profile;
+    elseif isfield(raw_data, 'price_data')
+        data.price_profile = raw_data.price_data;
+        fprintf('  - 已转换price_data为price_profile\n');
+    else
+        error('缺少电价数据: price_profile 或 price_data');
+    end
+    
+    % timeseries格式检查和修复
+    if ~isa(data.price_profile, 'timeseries')
+        if isnumeric(data.price_profile)
+            % 转换为timeseries
+            if isfield(raw_data, 'time_seconds')
+                time_vector = raw_data.time_seconds(:);
+            else
+                time_vector = (0:length(data.price_profile)-1)' * 3600;
+            end
+            data.price_profile = timeseries(data.price_profile(:), time_vector);
+            data.price_profile.Name = 'Electricity Price Profile';
+            data.price_profile.DataInfo.Units = 'CNY/kWh';
+            fprintf('  - 已重建电价时间序列\n');
+        else
+            error('无法处理电价数据格式: %s', class(data.price_profile));
+        end
+    end
+    
+    % 数据复制
+    data.pv_power = raw_data.pv_power_profile;
+    data.load_power = raw_data.load_power_profile;
+    
+    % 复制其他字段
+    field_names = fieldnames(raw_data);
+    for i = 1:length(field_names)
+        field_name = field_names{i};
+        if ~isfield(data, field_name)
+            data.(field_name) = raw_data.(field_name);
+        end
+    end
+    
+    % 验证数据长度
+    data.duration_hours = calculate_duration_hours(data.pv_power);
+    if data.duration_hours < 700
+        error('数据长度不足: 需要至少720小时，当前仅有%.0f小时', data.duration_hours);
+    end
+    
+    fprintf('  - 光伏数据: %.0f 小时\n', data.duration_hours);
+    fprintf('  - 负载数据: %.0f 小时\n', calculate_duration_hours(data.load_power));
+    fprintf('  - 电价数据: %.0f 小时\n', calculate_duration_hours(data.price_profile));
+
+    % 将关键数据推送到基础工作区，供Simulink模型使用
+    push_simulation_data_to_base(data, raw_data);
+end
+
+%% 3. Simulink环境设置（增强版）
+function [env, agent_var_name] = setup_simulink_environment(config, ~)
+    % 加载模型
+    if ~bdIsLoaded(config.model_name)
+        load_system(config.model_path);
+    end
+    
+    % 设置仿真参数
+    set_param(config.model_name, 'StopTime', num2str(config.simulation_time));
+    
+    % 定义观测和动作空间
+    obs_info = rlNumericSpec([9 1]);
+    obs_info.Name = 'Microgrid Observations';
+    obs_info.Description = 'Battery_SOC, P_pv, P_load, Price, P_net_load, P_batt, P_grid, reward, time_of_day';
+    
+    act_info = rlNumericSpec([1 1]);
+    act_info.Name = 'Battery Power';
+    act_info.LowerLimit = -10e3;
+    act_info.UpperLimit = 10e3;
+    act_info.Description = 'Continuous battery charge/discharge power';
+    
+    % 确保agentObj变量存在
+    agent_block = [config.model_name '/RL Agent'];
+    agent_var_name = ensure_agent_workspace_variable(agent_block, obs_info, act_info);
+    
+    % 创建Simulink环境
+    env = rlSimulinkEnv(config.model_name, agent_block, obs_info, act_info);
+    env.ResetFcn = @(in) setVariable(in, 'initial_soc', 50);
+    
+    fprintf('  - 观测维度: %d\n', obs_info.Dimension(1));
+    fprintf('  - 动作范围: [%.1f, %.1f] kW\n', act_info.LowerLimit/1000, act_info.UpperLimit/1000);
+    fprintf('  - agentObj变量: %s\n', agent_var_name);
+end
+
+%% 4. 执行训练（统一接口）
+function [agent, results] = execute_training(env, initial_agent, training_mode, ~)
+    switch lower(training_mode)
+        case 'auto'
+            % 自动选择：优先高级 -> 兼容 -> 原始
+            fprintf('使用自动模式，尝试最佳训练方法...\n');
+            try
+                fprintf('  -> 尝试高级训练方法\n');
+                [agent, results] = train_model(env, initial_agent, 'advanced');
+                fprintf('✓ 高级训练方法成功\n');
+            catch ME1
+                fprintf('  -> 高级方法失败: %s\n', ME1.message);
+                try
+                    fprintf('  -> 尝试兼容训练方法\n');
+                    [agent, results] = train_model(env, initial_agent, 'simple');
+                    fprintf('✓ 兼容训练方法成功\n');
+                catch ME2
+                    fprintf('  -> 兼容方法失败: %s\n', ME2.message);
+                    fprintf('  -> 使用原始训练方法\n');
+                    [agent, results] = train_model(env, initial_agent, 'legacy');
+                    fprintf('✓ 原始训练方法成功\n');
+                end
+            end
+            
+        case {'advanced', 'simple', 'legacy'}
+            [agent, results] = train_model(env, initial_agent, training_mode);
+            
+        otherwise
+            error('未知训练模式: %s', training_mode);
+    end
+end
+
+%% 5. 保存结果（增强版）
+function save_results(agent, results, config, training_mode, agent_var_name)
+    % 更新工作区变量
+    if ~isempty(agent_var_name)
+        assignin('base', agent_var_name, agent);
+        fprintf('  - 已更新工作区变量: %s\n', agent_var_name);
+    end
+    
+    % 保存到文件
+    timestamp_dt = datetime("now", "Format", "yyyyMMdd_HHmmss");
+    timestamp = char(timestamp_dt);
+    filename = sprintf('ddpg_agent_%s_%s.mat', training_mode, timestamp);
+    
+    % 保存额外信息
+    save_info = struct();
+    save_info.training_mode = training_mode;
+    save_info.matlab_version = version;
+    save_info.timestamp = timestamp_dt;
+    save_info.config = config;
+    
+    save(filename, 'agent', 'results', 'save_info');
+    fprintf('  - 文件: %s\n', filename);
+    
+    % 显示结果统计
+    if isfield(results, 'total_episodes')
+        fprintf('  - 训练回合: %d\n', results.total_episodes);
+        fprintf('  - 训练时长: %.2f分钟\n', results.training_time/60);
+        if isfield(results, 'best_reward')
+            fprintf('  - 最佳奖励: %.1f\n', results.best_reward);
+        end
+    end
+end
+
+%% 6. 最终性能验证
+function verify_final_performance(agent, env)
+    try
+        obs_info = getObservationInfo(env);
+        act_info = getActionInfo(env);
+        
+        % 测试连续动作生成
+        fprintf('测试连续动作生成...\n');
+        agent.UseExplorationPolicy = false;
+        
+        num_samples = 20;
+        actions = zeros(1, num_samples);
+        for i = 1:num_samples
+            test_obs = rand(obs_info.Dimension) * 0.5 + 0.25;
+            action_cell = getAction(agent, {test_obs});
+            actions(i) = action_cell{1};
+        end
+        
+        fprintf('  - 动作范围: [%.2f, %.2f] kW\n', min(actions)/1000, max(actions)/1000);
+        fprintf('  - 动作方差: %.2f kW²\n', var(actions)/1000);
+        fprintf('  - 唯一值: %d / %d\n', length(unique(round(actions, 1))), num_samples);
+        
+        % 验证连续性
+        is_continuous = length(unique(round(actions, 1))) > num_samples * 0.7;
+        in_range = all(actions >= act_info.LowerLimit-100) && all(actions <= act_info.UpperLimit+100);
+        has_variation = std(actions) > 50;
+        
+        if is_continuous && in_range && has_variation
+            fprintf('✅ 连续动作输出验证通过！\n');
+        else
+            fprintf('⚠️ 连续动作输出可能需要优化\n');
+        end
+        
+    catch ME
+        fprintf('最终验证失败: %s\n', ME.message);
+    end
+end
 
 %% 辅助函数
-% =========================================================================
 
-function in = localResetFcn(in)
-    % 环境重置函数
-    % 初始化SOC为50%
-    in = setVariable(in, 'initial_soc', 50);
+% 模糊逻辑文件加载
+function load_fuzzy_logic_files()
+    project_root = fileparts(fileparts(pwd));
+    model_dir = fullfile(project_root, 'model');
+    
+    if exist(model_dir, 'dir')
+        addpath(model_dir);
+    end
+    
+    fis_files = {
+        'Battery_State_Type2.fis'
+        'Battery_State.fis'
+        'Economic_Reward.fis'
+        'Economic_Decision.fis'
+    };
+    
+    for i = 1:length(fis_files)
+        fis_path = fullfile(model_dir, fis_files{i});
+        if exist(fis_path, 'file')
+            try
+                fis = readfis(fis_path);
+                var_name = strrep(fis_files{i}, '.fis', '');
+                assignin('base', var_name, fis);
+            catch
+                % 忽略个别文件加载错误
+            end
+        end
+    end
+    
+    % 创建必要变量
+    if ~evalin('base', 'exist(''eml_transient'', ''var'')')
+        assignin('base', 'eml_transient', struct());
+    end
+    
+    fuzzy_vars = {'price_norm', 0.5; 'soc_current', 50; 'soc_diff', 0; 'reward_signal', 0};
+    for i = 1:size(fuzzy_vars, 1)
+        var_name = fuzzy_vars{i, 1};
+        var_value = fuzzy_vars{i, 2};
+        if ~evalin('base', sprintf('exist(''%s'', ''var'')', var_name))
+            assignin('base', var_name, var_value);
+        end
+    end
 end
 
-function hours = getTimeseriesDurationHours(ts)
-    % 计算timeseries对象覆盖的总小时数 (支持缺省Time向量)
+% 将仿真数据分发到基础工作区
+function push_simulation_data_to_base(data, raw_data)
+    % 优先使用经过校验的数据对象
+    base_assignments = {
+        'price_profile', data.price_profile;
+        'pv_power_profile', data.pv_power;
+        'load_power_profile', data.load_power
+    };
+    for i = 1:size(base_assignments, 1)
+        var_name = base_assignments{i, 1};
+        var_value = base_assignments{i, 2};
+        assignin('base', var_name, var_value);
+    end
+
+    % 其余原始数据字段也同步到基础工作区，避免模型依赖缺失
+    raw_fields = fieldnames(raw_data);
+    for i = 1:numel(raw_fields)
+        field = raw_fields{i};
+        if ismember(field, {'price_profile', 'pv_power_profile', 'load_power_profile'})
+            continue; % 已使用处理后的版本
+        end
+        assignin('base', field, raw_data.(field));
+    end
+end
+
+% 确保智能体变量存在
+function agent_var_name = ensure_agent_workspace_variable(agent_block, obs_info, act_info)
+    agent_var_name = '';
+    try
+        agent_var_name = strtrim(get_param(agent_block, 'Agent'));
+    catch
+        return;
+    end
+    
+    if isempty(agent_var_name) || ~isvarname(agent_var_name)
+        agent_var_name = '';
+        return;
+    end
+    
+    % 检查现有变量
+    try
+        existing_agent = evalin('base', agent_var_name);
+    catch
+        existing_agent = [];
+    end
+    
+    if isa(existing_agent, 'rl.agent.Agent')
+        return;
+    end
+    
+    % 创建占位符智能体
+    try
+        placeholder_agent = create_placeholder_agent(obs_info, act_info);
+        assignin('base', agent_var_name, placeholder_agent);
+        fprintf('  - 已创建占位符智能体: %s\n', agent_var_name);
+    catch ME
+        fprintf('  - 占位符智能体创建失败: %s\n', ME.message);
+    end
+end
+
+% 创建占位符智能体
+function placeholder_agent = create_placeholder_agent(obs_info, act_info)
+    action_range = act_info.UpperLimit - act_info.LowerLimit;
+    action_scale = action_range / 2;
+    action_bias = (act_info.UpperLimit + act_info.LowerLimit) / 2;
+    
+    % 简化Actor网络
+    actor_layers = [
+        featureInputLayer(obs_info.Dimension(1), 'Name', 'state')
+        fullyConnectedLayer(32, 'Name', 'fc1')
+        reluLayer('Name', 'relu1')
+        fullyConnectedLayer(act_info.Dimension(1), 'Name', 'fc2')
+        tanhLayer('Name', 'tanh')
+        scalingLayer('Name', 'scaling', 'Scale', action_scale, 'Bias', action_bias)
+    ];
+    
+    actor_options = rlRepresentationOptions('LearnRate', 1e-3);
+    actor = rlDeterministicActorRepresentation(actor_layers, obs_info, act_info, ...
+        'Observation', {'state'}, actor_options);
+    
+    % 简化Critic网络
+    critic_layers = [
+        featureInputLayer(obs_info.Dimension(1) + act_info.Dimension(1), 'Name', 'input')
+        fullyConnectedLayer(64, 'Name', 'fc1')
+        reluLayer('Name', 'relu1')
+        fullyConnectedLayer(1, 'Name', 'output')
+    ];
+    
+    critic_options = rlRepresentationOptions('LearnRate', 1e-3);
+    critic = rlQValueRepresentation(critic_layers, obs_info, act_info, ...
+        'Observation', {'input'}, critic_options);
+    
+    agent_options = rlDDPGAgentOptions();
+    agent_options.SampleTime = 3600;
+    agent_options.DiscountFactor = 0.99;
+    
+    placeholder_agent = rlDDPGAgent(actor, critic, agent_options);
+end
+
+% 计算时长
+function hours = calculate_duration_hours(ts)
     hours = 0;
     if ~isa(ts, 'timeseries')
         return;
     end
-
-    sample_count = getTimeseriesSampleCount(ts);
-    if sample_count <= 1
-        return;
-    end
-
-    time_vector = ts.Time;
-    if ~isempty(time_vector)
-        time_vector = time_vector(:);
-        if isa(time_vector, 'datetime')
-            time_numeric = seconds(time_vector - time_vector(1));
-        elseif isa(time_vector, 'duration')
-            time_numeric = seconds(time_vector);
-        else
-            time_numeric = double(time_vector);
-        end
-        time_numeric = time_numeric(:);
-        diffs = diff(time_numeric);
-        diffs = diffs(diffs > 0);
-        if ~isempty(diffs)
-            avg_dt = median(diffs);
-            hours = sample_count * avg_dt / 3600;
-            return;
-        end
-    end
-
-    % 若Time向量为空或无效，尝试使用 TimeInfo 推断采样时间
-    increment = ts.TimeInfo.Increment;
-    if isa(increment, 'duration')
-        increment = seconds(increment);
-    end
-    if isempty(increment) || increment <= 0
-        t_start = ts.TimeInfo.Start;
-        t_end = ts.TimeInfo.End;
-        if isa(t_start, 'duration')
-            t_start = seconds(t_start);
-        end
-        if isa(t_end, 'duration')
-            t_end = seconds(t_end);
-        end
-        if ~isempty(t_start) && ~isempty(t_end) && t_end > t_start
-            increment = double(t_end - t_start) / (sample_count - 1);
-        else
-            return;
-        end
-    end
-
-    hours = sample_count * double(increment) / 3600;
-end
-
-function sample_count = getTimeseriesSampleCount(ts)
-    % 获取timeseries对象的样本数
-    sample_count = 0;
-    if ~isa(ts, 'timeseries') || isempty(ts.Data)
-        return;
-    end
-    if ts.IsTimeFirst
-        sample_count = size(ts.Data, 1);
-    else
-        sample_count = size(ts.Data, 2);
-    end
-end
-
-function agentVarName = ensureAgentWorkspaceVariable(agentBlk, obsInfo, actInfo)
-    % 确保RL Agent模块引用的变量存在并为有效的RL智能体
-    agentVarName = '';
-    try
-        agentVarName = strtrim(get_param(agentBlk, 'Agent'));
-    catch
-        return;
-    end
-
-    if isempty(agentVarName) || ~isvarname(agentVarName)
-        agentVarName = '';
-        return;
-    end
-
-    existingAgent = [];
-    try
-        existingAgent = evalin('base', agentVarName);
-    catch
-        existingAgent = [];
-    end
-
-    if isa(existingAgent, 'rl.agent.Agent')
-        return;
-    end
-
-    try
-        placeholderAgent = createDefaultDDPGAgent(obsInfo, actInfo);
-        assignin('base', agentVarName, placeholderAgent);
-        fprintf('  - 已创建 RL Agent 占位变量: %s (DDPG结构)\n', agentVarName);
-    catch ME
-        warning(E.message,'无法创建RL Agent占位变量: %s', ME.message);
-    end
-end
-
-function agent = createDefaultDDPGAgent(obsInfo, actInfo)
-    % 创建默认的DDPG智能体 (与train_model结构保持一致)
-
-    criticLayerSizes = [128, 64];
-    statePath = [
-        featureInputLayer(obsInfo.Dimension(1), 'Normalization', 'none', 'Name', 'observation')
-        fullyConnectedLayer(criticLayerSizes(1), 'Name', 'CriticStateFC1')
-        reluLayer('Name', 'CriticStateRelu1')
-    ];
-    actionPath = [
-        featureInputLayer(actInfo.Dimension(1), 'Normalization', 'none', 'Name', 'action')
-        fullyConnectedLayer(criticLayerSizes(1), 'Name', 'CriticActionFC1')
-    ];
-    commonPath = [
-        additionLayer(2, 'Name', 'add')
-        reluLayer('Name', 'CriticCommonRelu1')
-        fullyConnectedLayer(criticLayerSizes(2), 'Name', 'CriticFC2')
-        reluLayer('Name', 'CriticRelu2')
-        fullyConnectedLayer(1, 'Name', 'CriticOutput')
-    ];
-
-    criticNetwork = layerGraph(statePath);
-    criticNetwork = addLayers(criticNetwork, actionPath);
-    criticNetwork = addLayers(criticNetwork, commonPath);
-    criticNetwork = connectLayers(criticNetwork, 'CriticStateRelu1', 'add/in1');
-    criticNetwork = connectLayers(criticNetwork, 'CriticActionFC1', 'add/in2');
-
-    criticOptions = rlRepresentationOptions(...
-        'LearnRate', 1e-3, ...
-        'GradientThreshold', 1, ...
-        'UseDevice', 'cpu');
-
-    critic = rlQValueRepresentation(criticNetwork, obsInfo, actInfo, ...
-        'Observation', {'observation'}, ...
-        'Action', {'action'}, ...
-        criticOptions);
-
-    actorLayerSizes = [128, 64];
-    % Actor网络设计: 输出连续的功率信号
-    actorNetwork = [
-        featureInputLayer(obsInfo.Dimension(1), 'Normalization', 'none', 'Name', 'observation')
-        fullyConnectedLayer(actorLayerSizes(1), 'Name', 'ActorFC1')
-        reluLayer('Name', 'ActorRelu1')
-        fullyConnectedLayer(actorLayerSizes(2), 'Name', 'ActorFC2')
-        reluLayer('Name', 'ActorRelu2')
-        fullyConnectedLayer(actInfo.Dimension(1), 'Name', 'ActorFC3')
-        tanhLayer('Name', 'ActorTanh')  % 输出[-1, 1]
-    ];
     
-    % 将tanh输出[-1,1]缩放到动作空间[-UpperLimit, +UpperLimit]
-    actorNetwork = [
-        actorNetwork
-        scalingLayer('Name', 'ActorScaling', 'Scale', actInfo.UpperLimit)
-    ];
-
-    actorOptions = rlRepresentationOptions(...
-        'LearnRate', 5e-4, ...
-        'GradientThreshold', 1, ...
-        'UseDevice', 'cpu');
-
-    actor = rlDeterministicActorRepresentation(actorNetwork, obsInfo, actInfo, ...
-        'Observation', {'observation'}, ...
-        actorOptions);
-
-    agentOptions = rlDDPGAgentOptions(...
-        'SampleTime', 3600, ...
-        'TargetSmoothFactor', 1e-3, ...
-        'DiscountFactor', 0.99, ...
-        'MiniBatchSize', 64, ...
-        'ExperienceBufferLength', 1e6);
-    noise_span = (actInfo.UpperLimit - actInfo.LowerLimit) / 2;
-    base_noise = 0.2 * noise_span;
-    agentOptions.NoiseOptions.Mean = 0;
-    agentOptions.NoiseOptions.MeanAttractionConstant = 1e-4;
-    agentOptions.NoiseOptions.Variance = base_noise^2;
-    agentOptions.NoiseOptions.VarianceDecayRate = 5e-5;
-
-    agent = rlDDPGAgent(actor, critic, agentOptions);
+    if isempty(ts.Time)
+        sample_count = length(ts.Data);
+        hours = sample_count;
+    else
+        time_span = ts.Time(end) - ts.Time(1);
+        if isa(time_span, 'duration')
+            hours = hours(time_span);
+        else
+            hours = time_span / 3600;
+        end
+    end
 end

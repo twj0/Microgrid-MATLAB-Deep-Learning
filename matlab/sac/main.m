@@ -23,9 +23,11 @@
         end
 
         [data, raw_data] = load_and_validate_data(config);
-        fprintf('  - 光伏数据: %.0f 小时\n', data.duration_hours);
-        fprintf('  - 负载数据: %.0f 小时\n', calculate_duration_hours(data.load_power));
-        fprintf('  - 电价数据: %.0f 小时\n', calculate_duration_hours(data.price_profile));
+        fprintf('  - 光伏数据: %.0f 小时 (%d 样本)\n', data.duration_hours, data.sample_count);
+        fprintf('  - 负载数据: %.0f 小时 (%d 样本)\n', ...
+            calculate_duration_hours(data.load_power), calculate_sample_count(data.load_power));
+        fprintf('  - 电价数据: %.0f 小时 (%d 样本)\n', ...
+            calculate_duration_hours(data.price_profile), calculate_sample_count(data.price_profile));
         push_simulation_data_to_base(data, raw_data);
         fprintf('✓ 数据加载与分发完成\n');
 
@@ -125,9 +127,16 @@ function [data, raw_data] = load_and_validate_data(config)
     data.pv_power = raw_data.pv_power_profile;
     data.load_power = raw_data.load_power_profile;
     data.duration_hours = calculate_duration_hours(data.pv_power);
+    data.sample_count = calculate_sample_count(data.pv_power);
 
-    if data.duration_hours < 700
-        error('数据长度不足: 需要>=720小时, 当前%.0f小时', data.duration_hours);
+    required_samples = max(config.training.maxSteps, ceil(config.simulation_time / config.sample_time));
+
+    if data.sample_count < required_samples
+        error(['数据样本不足: 需要>=%d个样本（约%.0f小时）', ...
+               '，当前仅有%d个样本（约%.0f小时）。\n', ...
+               '请运行 matlab/src/generate_data.m 重新生成足够长度的时序数据。'], ...
+            required_samples, required_samples * (config.sample_time/3600), ...
+            data.sample_count, data.duration_hours);
     end
 end
 
@@ -166,11 +175,16 @@ function save_results(agent, results, config, agent_var_name)
 end
 
 function verify_policy(agent, env)
+    deterministic_supported = false;
+    old_flag = [];
     try
         obs_info = getObservationInfo(env);
         act_info = getActionInfo(env);
-        old_flag = agent.UseDeterministicExploitationPolicy;
-        agent.UseDeterministicExploitationPolicy = true;
+        deterministic_supported = isprop(agent, 'UseDeterministicExploitationPolicy');
+        if deterministic_supported
+            old_flag = agent.UseDeterministicExploitationPolicy;
+            agent.UseDeterministicExploitationPolicy = true;
+        end
 
         samples = 20;
         actions = zeros(samples, 1);
@@ -180,7 +194,9 @@ function verify_policy(agent, env)
             actions(i) = action_cell{1};
         end
 
-        agent.UseDeterministicExploitationPolicy = old_flag;
+        if deterministic_supported
+            agent.UseDeterministicExploitationPolicy = old_flag;
+        end
 
         fprintf('  - 验证动作范围: [%.2f, %.2f] kW\n', min(actions)/1000, max(actions)/1000);
         fprintf('  - 动作标准差: %.2f W\n', std(actions));
@@ -191,7 +207,7 @@ function verify_policy(agent, env)
             fprintf('  ⚠ 动作存在越界\n');
         end
     catch ME
-        if exist('old_flag', 'var')
+        if deterministic_supported && ~isempty(old_flag)
             try
                 agent.UseDeterministicExploitationPolicy = old_flag;
             catch
@@ -270,6 +286,27 @@ function duration = calculate_duration_hours(ts)
     end
 end
 
+function count = calculate_sample_count(ts)
+    count = 0;
+    if isa(ts, 'timeseries')
+        if isempty(ts.Data)
+            return;
+        end
+        if ts.IsTimeFirst
+            count = size(ts.Data, 1);
+        else
+            count = size(ts.Data, 2);
+        end
+        return;
+    end
+
+    if isnumeric(ts) || islogical(ts)
+        count = numel(ts);
+    elseif iscell(ts)
+        count = numel(ts);
+    end
+end
+
 function dt = infer_time_step(ts)
     dt = 3600;
     increment = ts.TimeInfo.Increment;
@@ -334,7 +371,7 @@ function agent = build_sac_agent(obs_info, act_info, cfg)
     critic1 = build_critic(obs_info, act_info, cfg.criticSizes, 'c1');
     critic2 = build_critic(obs_info, act_info, cfg.criticSizes, 'c2');
 
-    agent_opts = rlSACAgentOptions;
+    agent_opts = rlSACAgentOptions();
     agent_opts.SampleTime = cfg.sampleTime;
     agent_opts.TargetSmoothFactor = 5e-3;
     agent_opts.DiscountFactor = 0.99;
@@ -342,7 +379,30 @@ function agent = build_sac_agent(obs_info, act_info, cfg)
     agent_opts.MiniBatchSize = 128;
     agent_opts.EntropyWeightOptions.TargetEntropy = cfg.targetEntropy;
 
-    agent = rlSACAgent(actor, critic1, critic2, agent_opts);
+    call_attempts = {
+        {actor, [critic1, critic2], agent_opts};
+        {actor, [critic1, critic2]};
+        {actor, critic1, critic2, agent_opts};
+        {actor, critic1, agent_opts};
+        {actor, critic1}
+    };
+
+    agent = [];
+    last_error = [];
+    for idx = 1:numel(call_attempts)
+        args = call_attempts{idx};
+        try
+            agent = rlSACAgent(args{:});
+            last_error = [];
+            break;
+        catch ME
+            last_error = ME;
+        end
+    end
+
+    if isempty(agent)
+        rethrow(last_error);
+    end
 end
 
 function actor = build_actor(obs_info, act_info, layer_sizes)
@@ -425,8 +485,8 @@ function critic = build_critic(obs_info, act_info, layer_sizes, suffix)
     critic_lg = connectLayers(critic_lg, prev, ['q_value_' suffix]);
 
     critic_opts = rlRepresentationOptions('LearnRate', 3e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');
-    critic = rlQValueRepresentation(critic_lg, obs_info, act_info, ...
-        'Observation', {['state_' suffix]}, 'Action', {['action_' suffix]}, 'Options', critic_opts);
+    critic = instantiate_qvalue_representation(critic_lg, obs_info, act_info, ...
+        ['state_' suffix], ['action_' suffix], critic_opts);
 end
 
 function actor = instantiate_gaussian_actor(lg, obs_info, act_info, mean_name, std_name, opts)
@@ -473,6 +533,44 @@ function actor = instantiate_gaussian_actor(lg, obs_info, act_info, mean_name, s
     end
 
     error('SAC:MissingGaussianActorAPI', '当前MATLAB版本不支持创建连续高斯策略，请升级强化学习工具箱。');
+end
+
+function critic = instantiate_qvalue_representation(lg, obs_info, act_info, obs_name, act_name, opts)
+    if exist('rlQValueRepresentation', 'file') == 2
+        call_attempts = {
+            {'Observation', {obs_name}, 'Action', {act_name}, 'Options', opts};
+            {'Observation', {obs_name}, 'Action', {act_name}, opts};
+            {'Observation', {obs_name}, 'Action', {act_name}};
+            {opts}
+        };
+        for idx = 1:numel(call_attempts)
+            try
+                args = call_attempts{idx};
+                critic = rlQValueRepresentation(lg, obs_info, act_info, args{:});
+                return;
+            catch
+            end
+        end
+    end
+
+    if exist('rlRepresentation', 'file') == 2
+        call_attempts = {
+            {'Observation', {obs_name}, 'Action', {act_name}, 'Options', opts};
+            {'Observation', {obs_name}, 'Action', {act_name}, opts};
+            {'Observation', {obs_name}, 'Action', {act_name}};
+            {opts}
+        };
+        for idx = 1:numel(call_attempts)
+            try
+                args = call_attempts{idx};
+                critic = rlRepresentation(lg, obs_info, act_info, args{:});
+                return;
+            catch
+            end
+        end
+    end
+
+    error('SAC:MissingQValueAPI', '当前MATLAB版本不支持创建Q-value表示，请升级强化学习工具箱。');
 end
 
 function value = get_option(options, field, default_value)

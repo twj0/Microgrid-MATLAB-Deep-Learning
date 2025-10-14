@@ -180,8 +180,9 @@ function data = load_and_validate_data(config)
     
     % 验证数据长度
     data.duration_hours = calculate_duration_hours(data.pv_power);
-    if data.duration_hours < 700
-        error('数据长度不足: 需要至少720小时，当前仅有%.0f小时', data.duration_hours);
+    required_hours = config.simulation_time / 3600;
+    if data.duration_hours < required_hours
+        error('数据长度不足: 需要至少%.0f小时，当前仅有%.0f小时', required_hours, data.duration_hours);
     end
     
     fprintf('  - 光伏数据: %.0f 小时\n', data.duration_hours);
@@ -220,8 +221,17 @@ function [env, agent_var_name] = setup_simulink_environment(config, ~)
     % 创建Simulink环境
     env = rlSimulinkEnv(config.model_name, agent_block, obs_info, act_info);
     env.ResetFcn = @(in) setVariable(in, 'initial_soc', 50);
-    
+
+    try
+        reward_system = load_reward_system(config.model_dir);
+    catch ME
+        error('奖励系统加载失败: %s', ME.message);
+    end
+
+    env.ProcessExperienceFcn = @(experience) apply_mixed_reward(experience, reward_system);
+
     fprintf('  - 观测维度: %d\n', obs_info.Dimension(1));
+    fprintf('  - 奖励系统: 自洽跟踪 + 经济 + 健康 + 模糊修正\n');
     fprintf('  - 动作范围: [%.1f, %.1f] kW\n', act_info.LowerLimit/1000, act_info.UpperLimit/1000);
     fprintf('  - agentObj变量: %s\n', agent_var_name);
 end
@@ -345,6 +355,7 @@ function load_fuzzy_logic_files()
         'Battery_State.fis'
         'Economic_Reward.fis'
         'Economic_Decision.fis'
+        'fuzzy_correction.fis'
     };
     
     for i = 1:length(fis_files)
@@ -443,7 +454,7 @@ function placeholder_agent = create_placeholder_agent(obs_info, act_info)
     
     % 简化Actor网络
     actor_layers = [
-        featureInputLayer(obs_info.Dimension(1), 'Name', 'state')
+        featureInputLayer(obs_info.Dimension(1), 'Name', 'state', 'Normalization', 'none')
         fullyConnectedLayer(32, 'Name', 'fc1')
         reluLayer('Name', 'relu1')
         fullyConnectedLayer(act_info.Dimension(1), 'Name', 'fc2')
@@ -455,17 +466,38 @@ function placeholder_agent = create_placeholder_agent(obs_info, act_info)
     actor = rlDeterministicActorRepresentation(actor_layers, obs_info, act_info, ...
         'Observation', {'state'}, actor_options);
     
-    % 简化Critic网络
-    critic_layers = [
-        featureInputLayer(obs_info.Dimension(1) + act_info.Dimension(1), 'Name', 'input')
+    % 简化Critic网络，使用状态和动作分支
+    critic_lgraph = layerGraph();
+    
+    state_path = [
+        featureInputLayer(obs_info.Dimension(1), 'Normalization', 'none', 'Name', 'state')
+        fullyConnectedLayer(32, 'Name', 'state_fc1')
+        reluLayer('Name', 'state_relu1')
+    ];
+    
+    action_path = [
+        featureInputLayer(act_info.Dimension(1), 'Normalization', 'none', 'Name', 'action')
+        fullyConnectedLayer(32, 'Name', 'action_fc1')
+        reluLayer('Name', 'action_relu1')
+    ];
+    
+    common_path = [
+        concatenationLayer(1, 2, 'Name', 'concat')
         fullyConnectedLayer(64, 'Name', 'fc1')
         reluLayer('Name', 'relu1')
         fullyConnectedLayer(1, 'Name', 'output')
     ];
     
+    critic_lgraph = addLayers(critic_lgraph, state_path);
+    critic_lgraph = addLayers(critic_lgraph, action_path);
+    critic_lgraph = addLayers(critic_lgraph, common_path);
+    
+    critic_lgraph = connectLayers(critic_lgraph, 'state_relu1', 'concat/in1');
+    critic_lgraph = connectLayers(critic_lgraph, 'action_relu1', 'concat/in2');
+    
     critic_options = rlRepresentationOptions('LearnRate', 1e-3);
-    critic = rlQValueRepresentation(critic_layers, obs_info, act_info, ...
-        'Observation', {'input'}, critic_options);
+    critic = rlQValueRepresentation(critic_lgraph, obs_info, act_info, ...
+        'Observation', {'state'}, 'Action', {'action'}, critic_options);
     
     agent_options = rlDDPGAgentOptions();
     agent_options.SampleTime = 3600;

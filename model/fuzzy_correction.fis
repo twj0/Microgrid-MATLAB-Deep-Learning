@@ -1,0 +1,54 @@
+[System]
+Name='HierarchicalRewardFIS'
+Type='mamdani'
+Version=2.0
+NumInputs=3
+NumOutputs=1
+NumRules=6
+AndMethod='min'
+OrMethod='max'
+ImpMethod='min'
+AggMethod='max'
+DefuzzMethod='centroid'
+
+[Input1]
+Name='SOC'
+Range=[0 100]
+NumMFs=3
+MF1='Low':'trapmf',[0 0 40 50]
+MF2='Ok':'trimf',[40 50 60]
+MF3='High':'trapmf',[55 70 100 100]
+
+[Input2]
+Name='Price'
+Range=[0 1]
+NumMFs=3
+MF1='VeryLow':'trapmf',[0 0 0.2 0.3]
+MF2='Normal':'trimf',[0.25 0.45 0.65]
+MF3='VeryHigh':'trapmf',[0.6 0.75 1 1]
+
+[Input3]
+Name='NetLoadKW'
+Range=[-60 60]
+NumMFs=3
+MF1='HighDeficit':'trapmf',[10 20 60 60]
+MF2='Balanced':'trimf',[-15 0 15]
+MF3='HighSurplus':'trapmf',[-60 -60 -20 -10]
+
+[Output1]
+Name='RewardCorrection'
+Range=[-1 1]
+NumMFs=5
+MF1='LargeNegative':'trapmf',[-1 -1 -0.6 -0.3]
+MF2='SmallNegative':'trimf',[-0.5 -0.25 0]
+MF3='Zero':'trimf',[-0.1 0 0.1]
+MF4='SmallPositive':'trimf',[0 0.25 0.5]
+MF5='LargePositive':'trapmf',[0.3 0.6 1 1]
+
+[Rules]
+1 0 1, 1 (1) : 1
+3 1 0, 1 (1) : 1
+1 3 0, 5 (1) : 1
+0 1 3, 2 (1) : 1
+0 3 1, 4 (1) : 1
+2 0 2, 3 (1) : 1

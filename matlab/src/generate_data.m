@@ -165,8 +165,16 @@ fprintf('  - 平均日用电量: %.2f kWh\n', mean(sum(reshape(load_power(1:simu
 fprintf('\n正在生成分时电价曲线...\n');
 
 % 分时电价配置
-tou_plan = 'E-TOU-C';           % 可选: 'E-TOU-C', 'E-TOU-D'
-tier_level = 1;                 % 1 = 基础阶梯 (Below Baseline), 2 = 超基阶梯 (Above Baseline)
+% tou_plan可选: 'E-TOU-C', 'E-TOU-D'
+if ~exist('tou_plan', 'var') || isempty(tou_plan)
+    tou_plan = 'E-TOU-C';           % 默认费率方案
+end
+if isstring(tou_plan)
+    tou_plan = char(tou_plan);
+end
+if ~exist('tier_level', 'var') || isempty(tier_level)
+    tier_level = 1;                 % 默认阶梯 (Below Baseline)
+end
 simulation_start = datetime(2025, 7, 1, 0, 0, 0);  % 仿真起始时间 (可根据需要调整)
 
 % 初始化电价数组与标注
@@ -198,12 +206,13 @@ for idx = 1:numel(season_display)
     end
 end
 
-if strcmp(tou_plan, 'E-TOU-C')
-    peak_window_desc = '16:00-21:00 (每日)';
-elseif strcmp(tou_plan, 'E-TOU-D')
-    peak_window_desc = '17:00-20:00 (工作日)';
-else
-    peak_window_desc = '自定义';
+switch upper(tou_plan)
+    case 'E-TOU-C'
+        peak_window_desc = '16:00-21:00 (每日)';
+    case 'E-TOU-D'
+        peak_window_desc = '17:00-20:00 (工作日)';
+    otherwise
+        peak_window_desc = '自定义';
 end
 
 if tier_level == 1
@@ -508,4 +517,3 @@ end
 row_idx = 1 + is_peak;  % 1: Off-peak, 2: Peak
 price = prices(row_idx, tier);
 end
-

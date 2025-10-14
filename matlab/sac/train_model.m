@@ -1,4 +1,4 @@
-function [agent, results] = train_model(env, initial_agent, options)
+﻿function [agent, results] = train_model(env, initial_agent, options)
     if nargin < 2
         initial_agent = [];
     end
@@ -48,26 +48,19 @@ function [agent, results] = train_model(env, initial_agent, options)
 
     fprintf('\n=== 开始SAC训练 ===\n');
     t_start = tic;
-    results = struct(); % 初始化返回结果
     try
         stats = train(agent, env, train_opts);
         train_time = toc(t_start);
-        % 填充返回结果
-        results = summarize_training(stats, train_time, maxEpisodes);
+        training_summary = summarize_training(stats, train_time, maxEpisodes);
+        results = training_summary;  % 将结果赋值给results变量
         fprintf('\n✓ SAC训练完成\n');
-        fprintf('  - 总回合: %d\n', results.total_episodes);
-        fprintf('  - 最佳奖励: %.1f\n', results.best_reward);
-        fprintf('  - 平均奖励: %.1f\n', results.average_reward);
+        fprintf('  - 总回合: %d\n', training_summary.total_episodes);
+        fprintf('  - 最佳奖励: %.1f\n', training_summary.best_reward);
+        fprintf('  - 平均奖励: %.1f\n', training_summary.average_reward);
     catch ME
         train_time = toc(t_start);
-        % 在训练失败时初始化返回结果
-        results.total_episodes = 0;
-        results.best_reward = NaN;
-        results.final_reward = NaN;
-        results.average_reward = NaN;
-        results.episode_rewards = [];
-        results.training_time = train_time;
         fprintf('\n✗ SAC训练失败: %s\n', ME.message);
+        fprintf('  - 训练持续时间: %.1f 秒\n', train_time);
         rethrow(ME);
     end
 
@@ -80,7 +73,7 @@ function agent = create_sac_agent(obs_info, act_info, cfg)
     critic1 = build_critic(obs_info, act_info, cfg.criticLayerSizes, 'c1');
     critic2 = build_critic(obs_info, act_info, cfg.criticLayerSizes, 'c2');
 
-    agent_opts = rlSACAgentOptions;
+    agent_opts = rlSACAgentOptions();
     agent_opts.SampleTime = cfg.sampleTime;
     agent_opts.TargetSmoothFactor = 5e-3;
     agent_opts.DiscountFactor = 0.99;
@@ -89,33 +82,29 @@ function agent = create_sac_agent(obs_info, act_info, cfg)
     agent_opts.EntropyWeightOptions.TargetEntropy = cfg.targetEntropy;
     agent_opts.EntropyWeightOptions.LearnRate = 1e-3;
 
-    creation_attempts = {
-        @() rlSACAgent(actor, [critic1 critic2], agent_opts);
-        @() rlSACAgent(actor, critic1, critic2, agent_opts);
-        @() rlSACAgent(actor, critic1, agent_opts);
+    call_attempts = {
+        {actor, [critic1, critic2], agent_opts};
+        {actor, [critic1, critic2]};
+        {actor, critic1, critic2, agent_opts};
+        {actor, critic1, agent_opts};
+        {actor, critic1}
     };
-    attempt_labels = {
-        '[actor, [critic1 critic2], opts]';
-        '[actor, critic1, critic2, opts]';
-        '[actor, critic1, opts]'
-    };
-    agent_created = false;
+
+    agent = [];
     last_error = [];
-    for idx = 1:numel(creation_attempts)
+    for i = 1:numel(call_attempts)
+        args = call_attempts{i};
         try
-            agent = creation_attempts{idx}();
-            agent_created = true;
-            if idx > 1
-                fprintf('  - 使用兼容SAC构造签名: %s\n', attempt_labels{idx});
-            end
+            agent = rlSACAgent(args{:});
+            last_error = [];
             break;
         catch ME
             last_error = ME;
         end
     end
-    if ~agent_created
-        error('SAC:AgentCreationFailed', ...
-            '无法创建SAC智能体，最后一次错误: %s', last_error.message);
+
+    if isempty(agent)
+        rethrow(last_error);
     end
 
     fprintf('✓ 创建SAC智能体成功\n');
@@ -224,9 +213,14 @@ function results = summarize_training(stats, training_time, maxEpisodes)
 end
 
 function verify_continuous_actions(agent, obs_info, act_info, stage)
+    deterministic_supported = false;
+    original_flag = [];
     try
-        flag = agent.UseDeterministicExploitationPolicy;
-        agent.UseDeterministicExploitationPolicy = true;
+        deterministic_supported = isprop(agent, 'UseDeterministicExploitationPolicy');
+        if deterministic_supported
+            original_flag = agent.UseDeterministicExploitationPolicy;
+            agent.UseDeterministicExploitationPolicy = true;
+        end
         samples = 16;
         actions = zeros(samples, 1);
         for i = 1:samples
@@ -234,7 +228,9 @@ function verify_continuous_actions(agent, obs_info, act_info, stage)
             out = getAction(agent, {obs});
             actions(i) = out{1};
         end
-        agent.UseDeterministicExploitationPolicy = flag;
+        if deterministic_supported
+            agent.UseDeterministicExploitationPolicy = original_flag;
+        end
 
         fprintf('%s动作分布: 范围[%.1f, %.1f] W, 标准差 %.1f W\n', stage, min(actions), max(actions), std(actions));
         if any(actions < act_info.LowerLimit - 100) || any(actions > act_info.UpperLimit + 100)
@@ -243,9 +239,9 @@ function verify_continuous_actions(agent, obs_info, act_info, stage)
             fprintf('  ✅ 动作范围合理\n');
         end
     catch ME
-        if exist('flag', 'var')
+        if deterministic_supported && ~isempty(original_flag)
             try
-                agent.UseDeterministicExploitationPolicy = flag;
+                agent.UseDeterministicExploitationPolicy = original_flag;
             catch
             end
         end

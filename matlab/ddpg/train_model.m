@@ -54,11 +54,11 @@ function [agent, training_results] = train_model(env, initial_agent, mode)
         % 根据模式创建智能体
         switch lower(mode)
             case 'advanced'
-                agent = create_advanced_agent(obs_info, act_info);
+                agent = create_advanced_agent(obs_info, act_info, env);
             case 'simple'
-                agent = create_simple_agent(obs_info, act_info);
+                agent = create_simple_agent(obs_info, act_info, env);
             case 'legacy'
-                agent = create_legacy_agent(obs_info, act_info);
+                agent = create_legacy_agent(obs_info, act_info, env);
             otherwise
                 error('未知训练模式: %s', mode);
         end
@@ -98,11 +98,17 @@ function [agent, training_results] = train_model(env, initial_agent, mode)
 end
 
 %% 创建高级智能体 (修正版，最佳性能)
-function agent = create_advanced_agent(obs_info, act_info)
+function agent = create_advanced_agent(obs_info, act_info, env)
     fprintf('\n创建高级DDPG智能体...\n');
     
     num_obs = obs_info.Dimension(1);
     num_act = act_info.Dimension(1);
+
+    action_range = act_info.UpperLimit - act_info.LowerLimit;
+    action_scale = action_range / 2;
+    action_bias = (act_info.UpperLimit + act_info.LowerLimit) / 2;
+    sample_time = infer_environment_sample_time(env, 3600);
+    fprintf('  - 采样时间: %.6f s\n', sample_time);
     
     %% 1. 创建Critic网络（状态-动作融合架构）
     % 状态处理分支
@@ -146,10 +152,6 @@ function agent = create_advanced_agent(obs_info, act_info)
     
     %% 2. 创建Actor网络（确保连续输出）
     % 关键修复：正确配置scalingLayer
-    action_range = act_info.UpperLimit - act_info.LowerLimit;
-    action_scale = action_range / 2;  % tanh输出[-1,1]，需要缩放到范围的一半
-    action_bias = (act_info.UpperLimit + act_info.LowerLimit) / 2;  % 中心点偏移
-    
     actor_layers = [
         featureInputLayer(num_obs, 'Normalization', 'none', 'Name', 'state')
         fullyConnectedLayer(256, 'Name', 'actor_fc1')
@@ -175,31 +177,13 @@ function agent = create_advanced_agent(obs_info, act_info)
     
     %% 3. 创建DDPG智能体（优化配置）
     agent_options = rlDDPGAgentOptions(...
-        'SampleTime', 3600, ...
+        'SampleTime', sample_time, ...
         'TargetSmoothFactor', 1e-3, ...
         'DiscountFactor', 0.99, ...
         'MiniBatchSize', 64, ...
         'ExperienceBufferLength', 1e6);
     
-    % 版本自适应噪声配置
-    try
-        noise_std = action_scale * 0.3;
-        if exist('rlOrnsteinUhlenbeckActionNoise', 'file')
-            noise_options = rlOrnsteinUhlenbeckActionNoise(...
-                'Mean', 0, ...
-                'StandardDeviation', noise_std, ...
-                'MeanAttractionConstant', 0.15, ...
-                'StandardDeviationDecayRate', 1e-5);
-            agent_options.NoiseOptions = noise_options;
-            fprintf('  ✓ 使用新版本噪声配置\n');
-        else
-            agent_options.NoiseOptions.Variance = noise_std^2;
-            agent_options.NoiseOptions.VarianceDecayRate = 1e-5;
-            fprintf('  ✓ 使用兼容版本噪声配置\n');
-        end
-    catch
-        fprintf('  - 使用默认噪声配置\n');
-    end
+    agent_options = configure_agent_noise(agent_options, action_scale, sample_time, '高级');
     
     agent = rlDDPGAgent(actor, critic, agent_options);
     
@@ -209,7 +193,7 @@ function agent = create_advanced_agent(obs_info, act_info)
 end
 
 %% 创建简化智能体 (兼容版，最大兼容性)
-function agent = create_simple_agent(obs_info, act_info)
+function agent = create_simple_agent(obs_info, act_info, env)
     fprintf('\n创建简化DDPG智能体...\n');
     
     num_obs = obs_info.Dimension(1);
@@ -219,6 +203,9 @@ function agent = create_simple_agent(obs_info, act_info)
     action_range = act_info.UpperLimit - act_info.LowerLimit;
     action_scale = action_range / 2;
     action_bias = (act_info.UpperLimit + act_info.LowerLimit) / 2;
+
+    sample_time = infer_environment_sample_time(env, 3600);
+    fprintf('  - 采样时间: %.6f s\n', sample_time);
     
     %% 1. 简化Actor网络
     actor_layers = [
@@ -268,7 +255,7 @@ function agent = create_simple_agent(obs_info, act_info)
     
     %% 3. 基础DDPG智能体
     agent_options = rlDDPGAgentOptions();
-    agent_options.SampleTime = 3600;
+    agent_options.SampleTime = sample_time;
     agent_options.DiscountFactor = 0.99;
     agent_options.MiniBatchSize = 32;
     agent_options.ExperienceBufferLength = 50000;
@@ -279,6 +266,8 @@ function agent = create_simple_agent(obs_info, act_info)
         % 忽略不支持的参数
     end
     
+    agent_options = configure_agent_noise(agent_options, action_scale, sample_time, '简化');
+    
     agent = rlDDPGAgent(actor, critic, agent_options);
     
     fprintf('✓ 简化DDPG智能体创建完成\n');
@@ -287,11 +276,16 @@ function agent = create_simple_agent(obs_info, act_info)
 end
 
 %% 创建原始智能体 (保持原有逻辑)
-function agent = create_legacy_agent(obs_info, act_info)
+function agent = create_legacy_agent(obs_info, act_info, env)
     fprintf('\n创建原始DDPG智能体...\n');
     
     num_obs = obs_info.Dimension(1);
     num_act = act_info.Dimension(1);
+
+    action_range = act_info.UpperLimit - act_info.LowerLimit;
+    action_scale = action_range / 2;
+    sample_time = infer_environment_sample_time(env, 3600);
+    fprintf('  - 采样时间: %.6f s\n', sample_time);
     
     %% 1. 原始Critic网络
     critic_layer_sizes = [128, 64];
@@ -354,24 +348,148 @@ function agent = create_legacy_agent(obs_info, act_info)
     
     %% 3. 原始DDPG智能体
     agent_options = rlDDPGAgentOptions(...
-        'SampleTime', 3600, ...
+        'SampleTime', sample_time, ...
         'TargetSmoothFactor', 1e-3, ...
         'DiscountFactor', 0.99, ...
         'MiniBatchSize', 64, ...
         'ExperienceBufferLength', 1e6);
     
-    % 原始噪声配置
-    noise_span = (act_info.UpperLimit - act_info.LowerLimit) / 2;
-    base_noise = 0.2 * noise_span;
-    agent_options.NoiseOptions.Mean = 0;
-    agent_options.NoiseOptions.MeanAttractionConstant = 1e-4;
-    agent_options.NoiseOptions.Variance = base_noise^2;
-    agent_options.NoiseOptions.VarianceDecayRate = 5e-5;
+    agent_options = configure_agent_noise(agent_options, action_scale, sample_time, '原始', 'std_gain', 0.08, 'decay_rate', 5e-5);
     
     agent = rlDDPGAgent(actor, critic, agent_options);
     
     fprintf('✓ 原始DDPG智能体创建完成\n');
     fprintf('  - 注意: 使用原始配置，可能存在已知问题\n');
+end
+
+%% 推断环境采样时间
+function sample_time = infer_environment_sample_time(env, default_value)
+    if nargin < 2 || isempty(default_value)
+        default_value = 3600;
+    end
+    sample_time = default_value;
+    if isempty(env)
+        return;
+    end
+    candidate_props = {'Ts', 'AgentSampleTime', 'SampleTime'};
+    for idx = 1:numel(candidate_props)
+        prop = candidate_props{idx};
+        if isprop(env, prop)
+            value = env.(prop);
+            if isnumeric(value) && isscalar(value) && value > 0
+                sample_time = value;
+                return;
+            end
+        end
+    end
+    try
+        if isprop(env, 'Model') && isprop(env, 'AgentBlock')
+            model_name = env.Model;
+            agent_block = env.AgentBlock;
+            block_path = agent_block;
+            if isstring(block_path)
+                block_path = char(block_path);
+            end
+            if isstring(model_name)
+                model_name = char(model_name);
+            end
+            if ~contains(block_path, '/')
+                block_path = [model_name '/' block_path];
+            end
+            param = get_param(block_path, 'SampleTime');
+            numeric_dt = str2double(param);
+            if ~isnan(numeric_dt) && numeric_dt > 0
+                sample_time = numeric_dt;
+                return;
+            end
+        end
+    catch
+        % 忽略无法获取采样时间的情况，保持默认值
+    end
+end
+
+%% 配置探索噪声，确保OU噪声稳定
+function agent_options = configure_agent_noise(agent_options, action_scale, sample_time, mode_label, varargin)
+    if nargin < 4 || isempty(mode_label)
+        mode_label = '';
+    end
+    prefix = '';
+    if ~isempty(mode_label)
+        prefix = ['[' mode_label '] '];
+    end
+
+    std_gain = 0.08;
+    decay_rate = 1e-5;
+    base_theta = 0.15;
+    for idx = 1:2:numel(varargin)
+        key = varargin{idx};
+        if idx+1 > numel(varargin)
+            break;
+        end
+        value = varargin{idx+1};
+        switch lower(key)
+            case 'std_gain'
+                if isnumeric(value) && isscalar(value) && value > 0
+                    std_gain = value;
+                end
+            case 'decay_rate'
+                if isnumeric(value) && isscalar(value) && value > 0
+                    decay_rate = value;
+                end
+            case 'base_theta'
+                if isnumeric(value) && isscalar(value) && value > 0
+                    base_theta = value;
+                end
+        end
+    end
+
+    if ~(isnumeric(sample_time) && isscalar(sample_time) && sample_time > 0)
+        sample_time = agent_options.SampleTime;
+        if isempty(sample_time) || ~isnumeric(sample_time) || sample_time <= 0
+            sample_time = 3600;
+        end
+    end
+
+    noise_std = max(action_scale * std_gain, eps);
+    max_theta = 2 / max(sample_time, eps);
+    adjusted_theta = min(base_theta, 0.9 * max_theta);
+    adjusted_theta = max(adjusted_theta, 1e-6);
+    stability_metric = abs(1 - adjusted_theta * sample_time);
+
+    if adjusted_theta < base_theta
+        fprintf('  %sOU噪声θ从%.4g调整为%.6g以匹配采样时间%.4g秒，|1-θΔt|=%.4g\n', prefix, base_theta, adjusted_theta, sample_time, stability_metric);
+    else
+        fprintf('  %sOU噪声稳定性检查: θ=%.4g, 采样时间=%.4g秒, |1-θΔt|=%.4g\n', prefix, adjusted_theta, sample_time, stability_metric);
+    end
+
+    if exist('rlOrnsteinUhlenbeckActionNoise', 'file')
+        try
+            noise_obj = rlOrnsteinUhlenbeckActionNoise(...
+                'Mean', 0, ...
+                'StandardDeviation', noise_std, ...
+                'MeanAttractionConstant', adjusted_theta, ...
+                'StandardDeviationDecayRate', decay_rate);
+            agent_options.NoiseOptions = noise_obj;
+            fprintf('  %s使用OU噪声 (标准差 %.4g)\n', prefix, noise_std);
+            return;
+        catch ME
+            fprintf('  %sOU噪声创建失败: %s，改用高斯噪声。\n', prefix, ME.message);
+        end
+    end
+
+    try
+        agent_options.NoiseOptions.Mean = 0;
+        agent_options.NoiseOptions.MeanAttractionConstant = adjusted_theta;
+        agent_options.NoiseOptions.Variance = noise_std^2;
+        agent_options.NoiseOptions.VarianceDecayRate = decay_rate;
+    catch
+        agent_options.NoiseOptions = struct(...
+            'Mean', 0, ...
+            'MeanAttractionConstant', adjusted_theta, ...
+            'Variance', noise_std^2, ...
+            'VarianceDecayRate', decay_rate);
+    end
+    fprintf('  %s使用高斯噪声 (标准差 %.4g)\n', prefix, noise_std);
 end
 
 %% 配置训练选项

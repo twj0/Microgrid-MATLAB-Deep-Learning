@@ -362,7 +362,7 @@ function agent = create_placeholder_agent(obs_info, act_info, sample_time)
     cfg.actorSizes = [64 32];
     cfg.criticSizes = [128 64];
     cfg.sampleTime = sample_time;
-    cfg.targetEntropy = -act_info.Dimension(1);
+    cfg.targetEntropy = -0.5 * act_info.Dimension(1);  % 修正：增大目标熵，减少探索
     agent = build_sac_agent(obs_info, act_info, cfg);
 end
 
@@ -373,11 +373,12 @@ function agent = build_sac_agent(obs_info, act_info, cfg)
 
     agent_opts = rlSACAgentOptions();
     agent_opts.SampleTime = cfg.sampleTime;
-    agent_opts.TargetSmoothFactor = 5e-3;
+    agent_opts.TargetSmoothFactor = 1e-2;  % 增加平滑因子
     agent_opts.DiscountFactor = 0.99;
     agent_opts.ExperienceBufferLength = 1e6;
     agent_opts.MiniBatchSize = 128;
     agent_opts.EntropyWeightOptions.TargetEntropy = cfg.targetEntropy;
+    agent_opts.EntropyWeightOptions.LearnRate = 1e-3;  % 添加熵权重学习率
 
     call_attempts = {
         {actor, [critic1, critic2], agent_opts};
@@ -410,7 +411,6 @@ function actor = build_actor(obs_info, act_info, layer_sizes)
     num_act = act_info.Dimension(1);
     action_range = act_info.UpperLimit - act_info.LowerLimit;
     action_scale = action_range / 2;
-    action_bias = (act_info.UpperLimit + act_info.LowerLimit) / 2;
 
     lg = layerGraph();
     lg = addLayers(lg, featureInputLayer(num_obs, 'Normalization', 'none', 'Name', 'state'));
@@ -432,20 +432,19 @@ function actor = build_actor(obs_info, act_info, layer_sizes)
     lg = connectLayers(lg, prev, 'action_mean_fc');
     lg = connectLayers(lg, prev, 'action_logstd_fc');
 
-    scale_layer = scalingLayer('Name', 'action_mean_scale', 'Scale', action_scale, 'Bias', action_bias);
-    lg = addLayers(lg, scale_layer);
-    lg = connectLayers(lg, 'action_mean_fc', 'action_mean_scale');
-
     softplus_layer = softplusLayer('Name', 'action_std_softplus');
     lg = addLayers(lg, softplus_layer);
     lg = connectLayers(lg, 'action_logstd_fc', 'action_std_softplus');
 
-    std_scale = scalingLayer('Name', 'action_std_scale', 'Scale', action_scale, 'Bias', 1e-3);
+    % 修正：减小标准差缩放因子，避免动作总是达到边界值
+    % 原始值action_scale=10000导致标准差过大，改为更合理的值
+    std_scale_factor = min(action_scale * 0.05, 500);  % 使用5%的动作范围或500的较小值
+    std_scale = scalingLayer('Name', 'action_std_scale', 'Scale', std_scale_factor, 'Bias', 0.1);
     lg = addLayers(lg, std_scale);
     lg = connectLayers(lg, 'action_std_softplus', 'action_std_scale');
 
     actor_opts = rlRepresentationOptions('LearnRate', 3e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');
-    mean_name = 'action_mean_scale';
+    mean_name = 'action_mean_fc';
     std_name = 'action_std_scale';
     actor = instantiate_gaussian_actor(lg, obs_info, act_info, mean_name, std_name, actor_opts);
 end

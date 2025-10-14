@@ -12,7 +12,9 @@
     cfg.actorLayerSizes = get_option(options, 'actorLayerSizes', [256 128 64]);
     cfg.criticLayerSizes = get_option(options, 'criticLayerSizes', [256 128 64]);
     cfg.sampleTime = get_option(options, 'sampleTime', 3600);
-    cfg.targetEntropy = get_option(options, 'targetEntropy', -act_info.Dimension(1));
+    % 修正：增大目标熵，减少探索噪声
+    % 原始值-1太小，导致算法倾向于增加探索
+    cfg.targetEntropy = get_option(options, 'targetEntropy', -0.5 * act_info.Dimension(1));
 
     maxEpisodes = get_option(options, 'maxEpisodes', 120);
     maxSteps = get_option(options, 'maxSteps', 720);
@@ -75,7 +77,7 @@ function agent = create_sac_agent(obs_info, act_info, cfg)
 
     agent_opts = rlSACAgentOptions();
     agent_opts.SampleTime = cfg.sampleTime;
-    agent_opts.TargetSmoothFactor = 5e-3;
+    agent_opts.TargetSmoothFactor = 1e-2;  % 增加平滑因子，提高训练稳定性
     agent_opts.DiscountFactor = 0.99;
     agent_opts.ExperienceBufferLength = 1e6;
     agent_opts.MiniBatchSize = 256;
@@ -117,7 +119,6 @@ function actor = build_actor(obs_info, act_info, layer_sizes)
     num_act = act_info.Dimension(1);
     action_range = act_info.UpperLimit - act_info.LowerLimit;
     action_scale = action_range / 2;
-    action_bias = (act_info.UpperLimit + act_info.LowerLimit) / 2;
 
     lg = layerGraph();
     lg = addLayers(lg, featureInputLayer(num_obs, 'Normalization', 'none', 'Name', 'state'));
@@ -133,19 +134,20 @@ function actor = build_actor(obs_info, act_info, layer_sizes)
     end
 
     lg = addLayers(lg, fullyConnectedLayer(num_act, 'Name', 'actor_mean_fc'));
-    lg = addLayers(lg, scalingLayer('Name', 'actor_mean_scale', 'Scale', action_scale, 'Bias', action_bias));
     lg = addLayers(lg, fullyConnectedLayer(num_act, 'Name', 'actor_std_fc'));
     lg = addLayers(lg, softplusLayer('Name', 'actor_std_softplus'));
-    lg = addLayers(lg, scalingLayer('Name', 'actor_std_scale', 'Scale', action_scale, 'Bias', 1e-3));
+    % 修正：减小标准差缩放因子，避免动作总是达到边界值
+    std_scale_factor = min(action_scale * 0.05, 500);  % 使用5%的动作范围或500的较小值
+    lg = addLayers(lg, scalingLayer('Name', 'actor_std_scale', 'Scale', std_scale_factor, 'Bias', 0.1));
 
     lg = connectLayers(lg, previous, 'actor_mean_fc');
-    lg = connectLayers(lg, 'actor_mean_fc', 'actor_mean_scale');
     lg = connectLayers(lg, previous, 'actor_std_fc');
     lg = connectLayers(lg, 'actor_std_fc', 'actor_std_softplus');
     lg = connectLayers(lg, 'actor_std_softplus', 'actor_std_scale');
 
-    opts = rlRepresentationOptions('LearnRate', 3e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');
-    mean_name = 'actor_mean_scale';
+    % 修正：降低学习率，提高训练稳定性
+    opts = rlRepresentationOptions('LearnRate', 1e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');
+    mean_name = 'actor_mean_fc';
     std_name = 'actor_std_scale';
     actor = instantiate_gaussian_actor(lg, obs_info, act_info, mean_name, std_name, opts);
 end

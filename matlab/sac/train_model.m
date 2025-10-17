@@ -16,7 +16,7 @@
     % 原始值-1太小，导致算法倾向于增加探索
     cfg.targetEntropy = get_option(options, 'targetEntropy', -0.5 * act_info.Dimension(1));
 
-    maxEpisodes = get_option(options, 'maxEpisodes', 120);
+    maxEpisodes = get_option(options, 'maxEpisodes', 2000);
     maxSteps = get_option(options, 'maxSteps', 720);
     stopValue = get_option(options, 'stopValue', NaN);
 
@@ -146,7 +146,7 @@ function actor = build_actor(obs_info, act_info, layer_sizes)
     lg = connectLayers(lg, 'actor_std_softplus', 'actor_std_scale');
 
     % 修正：降低学习率，提高训练稳定性
-    opts = rlRepresentationOptions('LearnRate', 1e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');
+    opts = rlRepresentationOptions('LearnRate', 1e-4, 'GradientThreshold', 1, 'UseDevice', 'gpu');
     mean_name = 'actor_mean_fc';
     std_name = 'actor_std_scale';
     actor = instantiate_gaussian_actor(lg, obs_info, act_info, mean_name, std_name, opts);
@@ -187,7 +187,7 @@ function critic = build_critic(obs_info, act_info, layer_sizes, suffix)
     lg = addLayers(lg, fullyConnectedLayer(1, 'Name', ['q_value_' suffix]));
     lg = connectLayers(lg, previous, ['q_value_' suffix]);
 
-    opts = rlRepresentationOptions('LearnRate', 3e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');
+    opts = rlRepresentationOptions('LearnRate', 3e-4, 'GradientThreshold', 1, 'UseDevice', 'gpu');
     critic = instantiate_qvalue_representation(lg, obs_info, act_info, ['state_' suffix], ['action_' suffix], opts);
 end
 

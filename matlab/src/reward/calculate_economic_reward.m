@@ -1,15 +1,14 @@
 function total_reward = calculate_economic_reward(P_net_load_W, P_batt_W, price_norm, SOC)
-% CALCULATE_BENEFIT_REWARD - A reward function focused on positive reinforcement.
+% CALCULATE_ECONOMIC_REWARD - A reward function for economic optimization.
 %
-% This function is designed to reward beneficial actions rather than just
-% penalize costly ones. It identifies and quantifies the value created by
-% the BESS in three key areas: peak shaving, valley filling, and battery health.
+% This function calculates a reward for the RL agent based on economic criteria.
+% It considers grid interaction, electricity prices, and battery health.
 %
 % Inputs:
 %   P_net_load_W  - Net load the BESS must handle (P_load - P_pv) [W].
 %                   >0 means net consumption; <0 means surplus PV.
 %   P_batt_W      - Battery power command [W]. >0 for charging, <0 for discharging.
-%   price_norm    - Normalized electricity price [0, 1]. 0=lowest, 1=highest.
+%   price_norm    - Normalized electricity price. Either 0 (low) or 1 (high).
 %   SOC           - Battery state of charge [%].
 %
 % Output:
@@ -19,66 +18,81 @@ function total_reward = calculate_economic_reward(P_net_load_W, P_batt_W, price_
 % These values control the agent's priorities.
 
 % -- Weights --
-W_PEAK_SHAVING   = 1.5;   % Primary objective: Highest weight for reducing high net load.
-W_VALLEY_FILLING = 1.0;   % Secondary objective: Reward for charging at low prices.
-W_SOC_COMFORT    = 0.5;   % Background objective: Encourage staying in a healthy SOC range.
-W_DEGRADATION    = 0.2;   % Penalty: Discourage overly aggressive (high power) actions.
+W_PEAK_SHAVING   = 2.0;   % Reward for reducing demand during high-price periods.
+W_VALLEY_FILLING = 1.5;   % Reward for charging at low prices.
+W_GRID_SELLING   = 1.0;   % Reward for selling energy back to the grid.
+W_SOC_COMFORT    = 0.5;   % Encourage staying in a healthy SOC range.
+W_DEGRADATION    = 0.3;   % Penalty for aggressive charge/discharge actions.
 
 % -- Thresholds --
-PEAK_LOAD_THRESHOLD_W = 5000;  % [W] Net load above which we consider it a "peak" to be shaved.
-LOW_PRICE_THRESHOLD   = 0.3;   % [0,1] Price below which we encourage "valley filling" (charging).
+PEAK_LOAD_THRESHOLD_W = 4000;  % [W] Net load threshold for peak shaving.
+HIGH_PRICE_VALUE      = 1;     % Value indicating high price.
+LOW_PRICE_VALUE       = 0;     % Value indicating low price.
 
 % -- SOC Parameters --
-SOC_TARGET    = 50.0; % [%] The ideal center point for SOC.
-SOC_STD_DEV   = 30.0; % [%] Defines the width of the "comfort zone". Larger value = wider zone.
+SOC_TARGET      = 50.0;  % [%] The ideal center point for SOC.
+SOC_STD_DEV     = 20.0;  % [%] Width of the comfort zone.
+SOC_UPPER_LIMIT = 100;   % [%] Upper limit for SOC.
+SOC_LOWER_LIMIT = 0;     % [%] Lower limit for SOC.
 BATT_RATED_POWER_W = 10000; % [W] For normalizing the degradation penalty.
 
-% --- 2. Calculate Individual Reward Components ---
+% --- 2. Calculate Grid Power ---
+P_grid_W = P_net_load_W + P_batt_W;
+
+% --- 3. Calculate Individual Reward Components ---
 
 % Initialize all reward components to zero.
 peak_shaving_reward = 0;
 valley_filling_reward = 0;
+grid_selling_reward = 0;
 
 % (A) HIGH-VALUE REWARD: Peak Shaving
-% This reward is granted when the net load is high (a peak) and the battery
-% is discharging to reduce it. The reward is scaled by how high the price is.
-if P_net_load_W > PEAK_LOAD_THRESHOLD_W && P_batt_W < 0
-    % -P_batt_W is the positive power being supplied by the battery.
-    % price_norm scales the reward: shaving a peak at high price is more valuable.
-    peak_shaving_reward = W_PEAK_SHAVING * (-P_batt_W / 1000) * price_norm;
+% Reward for discharging during high-price periods to reduce grid consumption.
+if P_net_load_W > PEAK_LOAD_THRESHOLD_W && P_batt_W < 0 && price_norm == HIGH_PRICE_VALUE
+    % The higher the discharge power, the greater the reward (but still negative)
+    peak_shaving_reward = W_PEAK_SHAVING * (-P_batt_W / 1000);
 end
 
 % (B) OPPORTUNITY REWARD: Valley Filling (Arbitrage)
-% This reward is granted when the electricity price is low and the battery
-% is charging. The reward is scaled by how cheap the power is.
-if price_norm < LOW_PRICE_THRESHOLD && P_batt_W > 0
-    % (1 - price_norm) is a "cheapness factor". If price is 0.1, factor is 0.9.
-    valley_filling_reward = W_VALLEY_FILLING * (P_batt_W / 1000) * (1 - price_norm);
+% Reward for charging at low prices to store energy.
+if price_norm == LOW_PRICE_VALUE && P_batt_W > 0
+    valley_filling_reward = W_VALLEY_FILLING * (P_batt_W / 1000);
 end
 
-% (C) HEALTH REWARD: SOC Comfort Zone
+% (C) GRID SELLING REWARD
+% Reward for selling energy back to the grid (when P_grid < 0).
+if P_grid_W < -100  % Small tolerance to avoid rewarding noise
+    grid_selling_reward = W_GRID_SELLING * (-P_grid_W / 1000);
+end
+
+% (D) HEALTH REWARD: SOC Comfort Zone
 % A Gaussian reward that is maximum at SOC_TARGET and smoothly decreases
 % as SOC moves away. This encourages the agent to keep the battery ready.
-soc_deviation = SOC - SOC_TARGET;
-soc_comfort_reward = W_SOC_COMFORT * exp(- (soc_deviation^2) / (2 * SOC_STD_DEV^2));
+if SOC >= SOC_LOWER_LIMIT && SOC <= SOC_UPPER_LIMIT
+    soc_deviation = SOC - SOC_TARGET;
+    soc_comfort_reward = W_SOC_COMFORT * exp(- (soc_deviation^2) / (2 * SOC_STD_DEV^2));
+else
+    % Strong penalty for violating SOC limits
+    soc_comfort_reward = -50;
+end
 
-% (D) HEALTH PENALTY: Battery Degradation
+% (E) HEALTH PENALTY: Battery Degradation
 % A small quadratic penalty on battery power to discourage extreme charge/discharge
 % rates, promoting longer battery life.
-degradation_penalty = -W_DEGRADATION * (P_batt_W / BATT_RATED_POWER_W)^2;
+degradation_penalty = -W_DEGRADATION * (abs(P_batt_W) / BATT_RATED_POWER_W)^2;
 
-
-% --- 3. Summation and Final Safety Check ---
+% --- 4. Summation and Final Safety Check ---
 
 % Combine all components into the final reward signal.
 total_reward = peak_shaving_reward + ...
                valley_filling_reward + ...
+               grid_selling_reward + ...
                soc_comfort_reward + ...
                degradation_penalty;
 
 % HARD SAFETY CONSTRAINT: Override all rewards with a large penalty if SOC
-% goes outside the absolute physical/safety limits. This is non-negotiable.
-if SOC < -10 || SOC > 110
+% goes outside operational limits.
+if SOC < SOC_LOWER_LIMIT || SOC > SOC_UPPER_LIMIT
     total_reward = -100;
 end
 

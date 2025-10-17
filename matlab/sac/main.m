@@ -1,4 +1,4 @@
-﻿function main(options)
+function main(options)
     if nargin < 1 || isempty(options)
         options = struct();
     end
@@ -46,16 +46,38 @@
         [agent, results] = train_model(env, initial_agent, config.training);
         fprintf('✓ SAC训练完成\n');
 
+        if exist('results', 'var') && ~isempty(results)
+            assignin('base', 'sac_training_results', results);
+        end
+
         save_results(agent, results, config, agent_var_name);
         fprintf('✓ 训练结果已保存\n');
 
         verify_policy(agent, env);
         fprintf('✓ 策略验证完成\n');
 
+        try
+            run_visualization(config, results);
+        catch vizErr
+            fprintf('⚠ 可视化生成失败: %s\n', vizErr.message);
+        end
+
     catch ME
         fprintf('\n✗ 发生错误: %s\n', ME.message);
         if ~isempty(ME.stack)
             fprintf('位置: %s (第%d行)\n', ME.stack(1).name, ME.stack(1).line);
+        end
+        if exist('config', 'var')
+            try
+                if exist('results', 'var') && ~isempty(results)
+                    assignin('base', 'sac_training_results', results);
+                    run_visualization(config, results);
+                else
+                    run_visualization(config, []);
+                end
+            catch vizErr
+                fprintf('⚠ 可视化生成失败: %s\n', vizErr.message);
+            end
         end
         rethrow(ME);
     end
@@ -63,6 +85,53 @@
     fprintf('========================================\n');
     fprintf('  训练流程结束\n');
     fprintf('========================================\n');
+end
+
+function run_visualization(config, trainingResults)
+    if nargin < 2
+        trainingResults = [];
+    end
+
+    project_root = fileparts(config.model_dir);
+    matlab_src_dir = fullfile(project_root, 'matlab', 'src');
+    if exist(matlab_src_dir, 'dir')
+        addpath(matlab_src_dir);
+    end
+    expected_visualization = fullfile(matlab_src_dir, 'visualization.m');
+    visualization_path = which('visualization');
+    if isempty(visualization_path) || ~strcmpi(visualization_path, expected_visualization)
+        fprintf('⚠ 未找到visualization函数，跳过可视化生成\n');
+        return;
+    end
+
+    results_root = fullfile(project_root, 'results');
+    if ~exist(results_root, 'dir')
+        mkdir(results_root);
+    end
+
+    timestamp = char(datetime("now", "Format", "yyyyMMdd_HHmmss"));
+    sac_folder = fullfile(results_root, ['SAC_' timestamp]);
+    if ~exist(sac_folder, 'dir')
+        mkdir(sac_folder);
+    end
+
+    viz_options = struct( ...
+        'workspace', "base", ...
+        'saveFigures', true, ...
+        'showFigures', false, ...
+        'outputDir', sac_folder, ...
+        'filePrefix', "SAC", ...
+        'figureFormat', "png", ...
+        'closeAfterSave', true, ...
+        'timestamp', timestamp ...
+    );
+
+    if ~isempty(trainingResults)
+        viz_options.trainingResults = trainingResults;
+    end
+
+    visualization(viz_options);
+    fprintf('✓ 可视化已保存至: %s\n', sac_folder);
 end
 
 function config = initialize_environment(options)
@@ -79,7 +148,7 @@ function config = initialize_environment(options)
     config.sample_time = 3600;
     config.simulation_time = config.simulation_days * 24 * config.sample_time;
 
-    config.training.maxEpisodes = get_option(options, 'maxEpisodes', 120);
+    config.training.maxEpisodes = get_option(options, 'maxEpisodes', 2000);
     config.training.maxSteps = get_option(options, 'maxSteps', 720);
     config.training.stopValue = get_option(options, 'stopValue', 250);
     config.training.sampleTime = config.sample_time;

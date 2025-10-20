@@ -1,4 +1,4 @@
-﻿function [agent, results] = train_model(env, initial_agent, options)
+function [agent, results] = train_model(env, initial_agent, options)
     if nargin < 2
         initial_agent = [];
     end
@@ -40,7 +40,10 @@
     train_opts.Plots = 'training-progress';
     train_opts.ScoreAveragingWindowLength = max(1, min(5, maxEpisodes));
     train_opts.Verbose = true;
-    if ~isnan(stopValue)
+    if isnan(stopValue) || ~isfinite(stopValue)
+        train_opts.StopTrainingCriteria = 'EpisodeCount';
+        train_opts.StopTrainingValue = maxEpisodes;
+    else
         train_opts.StopTrainingCriteria = 'AverageReward';
         train_opts.StopTrainingValue = stopValue;
     end
@@ -49,6 +52,11 @@
     verify_continuous_actions(agent, obs_info, act_info, '训练前');
 
     fprintf('\n=== 开始SAC训练 ===\n');
+    
+    % 初始化最优结果管理
+    ensure_run_manager_on_path();
+    run_best_manager('init');
+    
     t_start = tic;
     try
         stats = train(agent, env, train_opts);
@@ -68,6 +76,48 @@
 
     fprintf('\n=== SAC训练后验证 ===\n');
     verify_continuous_actions(agent, obs_info, act_info, '训练后');
+    
+    % 提取并保存最优结果
+    try
+        fprintf('\n=== 最优结果管理 ===\n');
+        fprintf('提取episode数据...这可能需要几分钟\n');
+        episodeData = extract_best_episode([], agent, env, maxSteps);
+        
+        fprintf('\n比较并保存结果...\n');
+        run_best_manager('save', agent, results, episodeData);
+    catch ME
+        fprintf('⚠ 最优结果保存失败: %s\n', ME.message);
+        fprintf('  训练结果仍然有效,可继续使用\n');
+    end
+end
+
+function ensure_run_manager_on_path()
+persistent path_initialized
+if isempty(path_initialized)
+    current_dir = fileparts(mfilename('fullpath'));
+    project_root = find_project_root(current_dir);
+    run_manager_dir = fullfile(project_root, 'matlab', 'src', 'run_manager');
+    if exist(run_manager_dir, 'dir')
+        addpath(run_manager_dir);
+    end
+    path_initialized = true;
+end
+end
+
+function project_root = find_project_root(start_dir)
+project_root = start_dir;
+max_depth = 10;
+for i = 1:max_depth
+    if exist(fullfile(project_root, 'matlab'), 'dir') && exist(fullfile(project_root, 'model'), 'dir')
+        return;
+    end
+    parent_dir = fileparts(project_root);
+    if isempty(parent_dir) || strcmp(parent_dir, project_root)
+        break;
+    end
+    project_root = parent_dir;
+end
+error('SAC:ProjectRootNotFound', '无法从路径%s定位项目根目录', start_dir);
 end
 
 function agent = create_sac_agent(obs_info, act_info, cfg)
@@ -193,16 +243,54 @@ end
 
 function results = summarize_training(stats, training_time, maxEpisodes)
     results = struct();
-    if isfield(stats, 'EpisodeReward')
-        results.episode_rewards = stats.EpisodeReward;
-        results.total_episodes = numel(stats.EpisodeReward);
-        results.best_reward = max(stats.EpisodeReward);
-        results.final_reward = stats.EpisodeReward(end);
-        if isfield(stats, 'AverageReward')
-            results.average_reward = stats.AverageReward(end);
+    if isfield(stats, 'EpisodeReward') && ~isempty(stats.EpisodeReward)
+        rewards = stats.EpisodeReward;
+        if iscell(rewards)
+            rewards = cellfun(@(x) convert_scalar(x), rewards);
+        end
+        rewards = double(rewards(:));
+
+        results.episode_rewards = rewards;
+        results.requested_episodes = maxEpisodes;
+        results.recorded_episode_slots = numel(rewards);
+
+        valid_reward_mask = ~isnan(rewards);
+        results.total_episodes = nnz(valid_reward_mask);
+        results.nan_episode_count = results.recorded_episode_slots - results.total_episodes;
+
+        if results.total_episodes > 0
+            results.best_reward = max(rewards(valid_reward_mask));
+            last_valid_idx = find(valid_reward_mask, 1, 'last');
+            results.final_reward = rewards(last_valid_idx);
+            results.last_episode_index = last_valid_idx;
         else
-            tail = max(1, results.total_episodes - 4);
-            results.average_reward = mean(stats.EpisodeReward(tail:end));
+            results.best_reward = NaN;
+            results.final_reward = NaN;
+            results.last_episode_index = NaN;
+        end
+
+        if isfield(stats, 'AverageReward') && ~isempty(stats.AverageReward)
+            avg_values = stats.AverageReward;
+            if iscell(avg_values)
+                avg_values = cellfun(@(x) convert_scalar(x), avg_values);
+            end
+            avg_values = double(avg_values(:));
+            valid_avg_mask = ~isnan(avg_values);
+            if any(valid_avg_mask)
+                last_avg_idx = find(valid_avg_mask, 1, 'last');
+                results.average_reward = avg_values(last_avg_idx);
+            else
+                results.average_reward = NaN;
+            end
+        else
+            tail_start = max(1, results.total_episodes - 4);
+            tail_rewards = rewards(valid_reward_mask);
+            if results.total_episodes >= 1
+                effective_tail = tail_rewards(max(1, end - (results.total_episodes - tail_start)):end);
+                results.average_reward = mean(effective_tail);
+            else
+                results.average_reward = NaN;
+            end
         end
     else
         results.episode_rewards = [];
@@ -210,8 +298,20 @@ function results = summarize_training(stats, training_time, maxEpisodes)
         results.best_reward = NaN;
         results.final_reward = NaN;
         results.average_reward = NaN;
+        results.requested_episodes = maxEpisodes;
+        results.recorded_episode_slots = 0;
+        results.nan_episode_count = maxEpisodes;
+        results.last_episode_index = NaN;
     end
     results.training_time = training_time;
+end
+
+function value = convert_scalar(x)
+    if isempty(x)
+        value = NaN;
+    else
+        value = double(x);
+    end
 end
 
 function verify_continuous_actions(agent, obs_info, act_info, stage)

@@ -1,4 +1,4 @@
-﻿%% 微电网DDPG强化学习 - 统一主程序
+%% 微电网DDPG强化学习 - 统一主程序
 % =========================================================================
 % 功能: 训练DDPG智能体优化微电网储能调度
 % 特色: 合并main.m和main_simplified.m的所有优点
@@ -99,7 +99,8 @@ end
 %% 1. 环境初始化
 function config = initialize_environment()
     % 路径配置
-    project_root = fileparts(fileparts(pwd));
+    script_dir = fileparts(mfilename('fullpath'));
+    project_root = find_project_root(script_dir);
     model_dir = fullfile(project_root, 'model');
     
     % 添加关键路径
@@ -112,6 +113,7 @@ function config = initialize_environment()
     config.data_path = fullfile(project_root, 'matlab', 'src', 'microgrid_simulation_data.mat');
     config.simulation_days = 30;
     config.simulation_time = config.simulation_days * 24 * 3600;
+    config.sample_time = 3600;
     config.model_dir = model_dir;
     
     % 文件存在性检查
@@ -179,12 +181,52 @@ function data = load_and_validate_data(config)
     end
     
     % 验证数据长度
+    data.sample_count = calculate_sample_count(data.pv_power);
+    required_samples = ceil(config.simulation_time / config.sample_time);
+
+    if data.sample_count < required_samples
+        deficit = required_samples - data.sample_count;
+        max_auto_pad = 24;
+        if deficit <= max_auto_pad
+            fprintf(['⚠ 数据样本不足: 缺少%d个样本（约%.0f小时），', ...
+                     '自动复制最后一个时刻的数据进行补齐。\n'], ...
+                deficit, deficit * (config.sample_time/3600));
+
+            data.price_profile = pad_timeseries_to_length(data.price_profile, required_samples, config.sample_time);
+            data.pv_power = pad_timeseries_to_length(data.pv_power, required_samples, config.sample_time);
+            data.load_power = pad_timeseries_to_length(data.load_power, required_samples, config.sample_time);
+
+            if isfield(raw_data, 'pv_power_profile')
+                raw_data.pv_power_profile = data.pv_power;
+            end
+            if isfield(raw_data, 'load_power_profile')
+                raw_data.load_power_profile = data.load_power;
+            end
+            if isfield(raw_data, 'price_profile')
+                raw_data.price_profile = data.price_profile;
+            end
+            if isfield(raw_data, 'price_data')
+                raw_data.price_data = pad_timeseries_to_length(raw_data.price_data, required_samples, config.sample_time);
+            end
+
+            data.sample_count = calculate_sample_count(data.pv_power);
+        else
+            required_hours = required_samples * (config.sample_time/3600);
+            error(['数据样本不足: 需要>=%d个样本（约%.0f小时）', ...
+                   '，当前仅有%d个样本（约%.0f小时）。\n', ...
+                   '请运行 matlab/src/generate_data.m 重新生成足够长度的时序数据。'], ...
+                required_samples, required_hours, ...
+                data.sample_count, data.sample_count * (config.sample_time/3600));
+        end
+    end
+
     data.duration_hours = calculate_duration_hours(data.pv_power);
     required_hours = config.simulation_time / 3600;
-    if data.duration_hours < required_hours
+    tolerance_hours = max(config.sample_time / 3600, 1e-6);
+    if data.duration_hours + tolerance_hours < required_hours
         error('数据长度不足: 需要至少%.0f小时，当前仅有%.0f小时', required_hours, data.duration_hours);
     end
-    
+
     fprintf('  - 光伏数据: %.0f 小时\n', data.duration_hours);
     fprintf('  - 负载数据: %.0f 小时\n', calculate_duration_hours(data.load_power));
     fprintf('  - 电价数据: %.0f 小时\n', calculate_duration_hours(data.price_profile));
@@ -204,9 +246,9 @@ function [env, agent_var_name] = setup_simulink_environment(config, ~)
     set_param(config.model_name, 'StopTime', num2str(config.simulation_time));
     
     % 定义观测和动作空间
-    obs_info = rlNumericSpec([9 1]);
+    obs_info = rlNumericSpec([12 1]);
     obs_info.Name = 'Microgrid Observations';
-    obs_info.Description = 'Battery_SOC, P_pv, P_load, Price, P_net_load, P_batt, P_grid, reward, time_of_day';
+    obs_info.Description = 'Battery_SOH, Battery_SOC, P_pv, P_load, Price, P_net_load, P_batt, P_grid, fuzzy_reward, economic_reward, health_reward, time_of_day';
     
     act_info = rlNumericSpec([1 1]);
     act_info.Name = 'Battery Power';
@@ -343,7 +385,8 @@ end
 
 % 模糊逻辑文件加载
 function load_fuzzy_logic_files()
-    project_root = fileparts(fileparts(pwd));
+    script_dir = fileparts(mfilename('fullpath'));
+    project_root = find_project_root(script_dir);
     model_dir = fullfile(project_root, 'model');
     
     if exist(model_dir, 'dir')
@@ -507,21 +550,266 @@ function placeholder_agent = create_placeholder_agent(obs_info, act_info)
 end
 
 % 计算时长
-function hours = calculate_duration_hours(ts)
-    hours = 0;
-    if ~isa(ts, 'timeseries')
+function duration = calculate_duration_hours(ts)
+    duration = 0;
+    if isa(ts, 'timeseries')
+        if isempty(ts.Data)
+            return;
+        end
+
+        if ts.IsTimeFirst
+            sample_count = size(ts.Data, 1);
+        else
+            sample_count = size(ts.Data, 2);
+        end
+        if sample_count <= 1
+            return;
+        end
+
+        if ~isempty(ts.Time)
+            t = ts.Time;
+            if isa(t, 'duration')
+                numeric_time = seconds(t);
+            elseif isa(t, 'datetime')
+                numeric_time = seconds(t - t(1));
+            else
+                numeric_time = double(t);
+            end
+            duration = (numeric_time(end) - numeric_time(1)) / 3600;
+            if duration <= 0
+                duration = (sample_count - 1) * infer_time_step(ts) / 3600;
+            end
+        else
+            duration = (sample_count - 1) * infer_time_step(ts) / 3600;
+        end
         return;
     end
-    
-    if isempty(ts.Time)
-        sample_count = length(ts.Data);
-        hours = sample_count;
-    else
-        time_span = ts.Time(end) - ts.Time(1);
-        if isa(time_span, 'duration')
-            hours = hours(time_span);
+
+    if isnumeric(ts) || islogical(ts)
+        sample_count = numel(ts);
+        if sample_count <= 1
+            duration = 0;
         else
-            hours = time_span / 3600;
+            duration = sample_count - 1;
+        end
+    elseif iscell(ts)
+        sample_count = numel(ts);
+        if sample_count <= 1
+            duration = 0;
+        else
+            duration = sample_count - 1;
         end
     end
 end
+
+function count = calculate_sample_count(ts)
+    count = 0;
+    if isa(ts, 'timeseries')
+        if isempty(ts.Data)
+            return;
+        end
+        if ts.IsTimeFirst
+            count = size(ts.Data, 1);
+        else
+            count = size(ts.Data, 2);
+        end
+        return;
+    end
+
+    if isnumeric(ts) || islogical(ts)
+        count = numel(ts);
+    elseif iscell(ts)
+        count = numel(ts);
+    end
+end
+
+function dt = infer_time_step(ts)
+    dt = 3600;
+    increment = ts.TimeInfo.Increment;
+    if isa(increment, 'duration')
+        increment = seconds(increment);
+    end
+    if ~isempty(increment) && increment > 0
+        dt = double(increment);
+        return;
+    end
+    if ~isempty(ts.TimeInfo.End) && ~isempty(ts.TimeInfo.Start)
+        t_start = ts.TimeInfo.Start;
+        t_end = ts.TimeInfo.End;
+        if isa(t_start, 'duration')
+            t_start = seconds(t_start);
+        end
+        if isa(t_end, 'duration')
+            t_end = seconds(t_end);
+        end
+        dt = double(t_end - t_start) / max(1, (ts.Length - 1));
+    end
+end
+
+function ts_out = pad_timeseries_to_length(ts_in, target_samples, sample_time)
+    ts_out = ts_in;
+
+    if isa(ts_in, 'timeseries')
+        ts_out = ts_in.copy;
+        current_samples = calculate_sample_count(ts_out);
+        missing = target_samples - current_samples;
+        if missing <= 0
+            return;
+        end
+
+        dt = infer_time_step(ts_out);
+        if ~isfinite(dt) || dt <= 0
+            dt = sample_time;
+        end
+
+        if isempty(ts_out.Time)
+            base_time = (0:current_samples-1)' * dt;
+            ts_out.Time = base_time;
+        end
+
+        data = ts_out.Data;
+        rep_shape = ones(1, ndims(data));
+
+        if ts_out.IsTimeFirst
+            rep_shape(1) = missing;
+            last_sample = data(end,:,:,:,:,:);
+            pad_data = repmat(last_sample, rep_shape);
+            ts_out.Data = cat(1, data, pad_data);
+            if ~isempty(ts_out.Quality)
+                quality = ts_out.Quality;
+                last_quality = quality(end,:,:,:,:,:);
+                pad_quality = repmat(last_quality, rep_shape);
+                ts_out.Quality = cat(1, quality, pad_quality);
+            end
+        else
+            rep_shape(2) = missing;
+            last_sample = data(:,end,:,:,:,:);
+            pad_data = repmat(last_sample, rep_shape);
+            ts_out.Data = cat(2, data, pad_data);
+            if ~isempty(ts_out.Quality)
+                quality = ts_out.Quality;
+                last_quality = quality(:,end,:,:,:,:);
+                pad_quality = repmat(last_quality, rep_shape);
+                ts_out.Quality = cat(2, quality, pad_quality);
+            end
+        end
+
+        time_tail = build_time_extension(ts_out.Time, dt, missing);
+        ts_out.Time = concatenate_time(ts_out.Time, time_tail);
+        if isempty(ts_out.TimeInfo.Increment)
+            if isa(ts_out.Time(end), 'duration') || isa(ts_out.Time(end), 'datetime')
+                ts_out.TimeInfo.Increment = seconds(dt);
+            else
+                ts_out.TimeInfo.Increment = dt;
+            end
+        end
+        return;
+    end
+
+    if isnumeric(ts_in) || islogical(ts_in)
+        data = ts_in;
+        if isvector(data)
+            column = data(:);
+            missing = target_samples - numel(column);
+            if missing <= 0
+                if isrow(data)
+                    ts_out = data;
+                else
+                    ts_out = column;
+                end
+                return;
+            end
+            pad_values = repmat(column(end), missing, 1);
+            padded = [column; pad_values];
+            if isrow(ts_in)
+                ts_out = padded.';
+            else
+                ts_out = padded;
+            end
+            return;
+        end
+
+        current_samples = size(data, 1);
+        missing = target_samples - current_samples;
+        if missing <= 0
+            ts_out = data;
+            return;
+        end
+        rep_shape = ones(1, ndims(data));
+        rep_shape(1) = missing;
+        last_sample = data(end,:,:,:,:,:);
+        pad_data = repmat(last_sample, rep_shape);
+        ts_out = cat(1, data, pad_data);
+    elseif iscell(ts_in)
+        data = ts_in(:);
+        current_samples = numel(data);
+        missing = target_samples - current_samples;
+        if missing <= 0
+            ts_out = data;
+            return;
+        end
+        pad_values = repmat(data(end), missing, 1);
+        ts_out = [data; pad_values];
+    end
+end
+
+function extension = build_time_extension(time_vector, dt, missing)
+    if missing <= 0
+        extension = [];
+        return;
+    end
+
+    if isempty(time_vector)
+        extension = (0:missing-1)' * dt;
+        return;
+    end
+
+    last_time = time_vector(end);
+    if isa(last_time, 'duration')
+        extension = last_time + seconds((1:missing)' * dt);
+    elseif isa(last_time, 'datetime')
+        extension = last_time + seconds((1:missing)' * dt);
+    else
+        extension = last_time + (1:missing)' * dt;
+    end
+end
+
+function combined = concatenate_time(original, extension)
+    if isempty(extension)
+        combined = original;
+        return;
+    end
+    if isempty(original)
+        combined = extension;
+        return;
+    end
+
+    if isrow(original)
+        if iscolumn(extension)
+            extension = extension.';
+        end
+        combined = [original, extension];
+    else
+        if isrow(extension)
+            extension = extension.';
+        end
+        combined = [original; extension];
+    end
+end
+
+function project_root = find_project_root(start_dir)
+    project_root = start_dir;
+    max_depth = 10;
+    for i = 1:max_depth
+        if exist(fullfile(project_root, 'matlab'), 'dir') && exist(fullfile(project_root, 'model'), 'dir')
+            return;
+        end
+        parent_dir = fileparts(project_root);
+        if isempty(parent_dir) || strcmp(parent_dir, project_root)
+            break;
+        end
+        project_root = parent_dir;
+    end
+    error('DDPG:ProjectRootNotFound', '无法从路径%s定位项目根目录', start_dir);
+end
+

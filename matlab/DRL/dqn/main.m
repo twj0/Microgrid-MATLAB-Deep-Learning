@@ -34,6 +34,31 @@ try
     [env, agent_var_name, action_set] = setup_simulink_environment(config);
     fprintf('✓ Simulink环境配置完成\n');
 
+    try
+        exists_flag = evalin('base','exist(''g_episode_num'',''var'')');
+    catch
+        exists_flag = 0;
+    end
+    if ~exists_flag
+        g_episode_num = Simulink.Parameter(0);
+        g_episode_num.CoderInfo.StorageClass = 'ExportedGlobal';
+        assignin('base','g_episode_num', g_episode_num);
+    else
+        try
+            g = evalin('base','g_episode_num');
+            if isa(g,'Simulink.Parameter')
+                g.Value = 0;
+                assignin('base','g_episode_num', g);
+            else
+                assignin('base','g_episode_num', 0);
+            end
+        catch
+            assignin('base','g_episode_num', 0);
+        end
+    end
+
+    env.ResetFcn = @reset_episode_counter;
+
     initial_agent = [];
     if ~isempty(agent_var_name)
         try
@@ -131,8 +156,35 @@ if ~isempty(trainingResults)
     viz_options.trainingResults = trainingResults;
 end
 
+% 预加载最优episode数据到workspace，确保可视化有数据源
+try
+    [~, episodeData_best, ~] = run_best_manager('load');
+    if ~isempty(episodeData_best)
+        fns = fieldnames(episodeData_best);
+        for i = 1:numel(fns)
+            fn = fns{i};
+            if contains(fn, {'Battery','SOC','SOH','Power','Cost','Reward'})
+                assignin('base', fn, episodeData_best.(fn));
+            end
+        end
+    end
+catch ME
+    fprintf('⚠ 预加载最优数据失败: %s\n', ME.message);
+end
+
 visualization(viz_options);
 fprintf('✓ 可视化已保存至: %s\n', dqn_folder);
+end
+
+function in = reset_episode_counter(in)
+persistent ep
+if isempty(ep)
+    ep = 0;
+end
+ep = ep + 1;
+assignin('base','g_episode_num', ep);
+in = setVariable(in, 'g_episode_num', ep);
+in = setVariable(in, 'initial_soc', 50);
 end
 
 function config = initialize_environment(options)

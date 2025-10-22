@@ -3,6 +3,17 @@ function main(options)
         options = struct();
     end
 
+function in = reset_episode_counter(in)
+    persistent ep
+    if isempty(ep)
+        ep = 0;
+    end
+    ep = ep + 1;
+    assignin('base','g_episode_num', ep);
+    in = setVariable(in, 'g_episode_num', ep);
+    in = setVariable(in, 'initial_soc', 50);
+end
+
     clc;
     close all;
 
@@ -31,6 +42,31 @@ function main(options)
 
         [env, agent_var_name] = setup_simulink_environment(config);
         fprintf('✓ Simulink environment configured\n');
+
+        try
+            exists_flag = evalin('base','exist(''g_episode_num'',''var'')');
+        catch
+            exists_flag = 0;
+        end
+        if ~exists_flag
+            g_episode_num = Simulink.Parameter(0);
+            g_episode_num.CoderInfo.StorageClass = 'ExportedGlobal';
+            assignin('base','g_episode_num', g_episode_num);
+        else
+            try
+                g = evalin('base','g_episode_num');
+                if isa(g,'Simulink.Parameter')
+                    g.Value = 0;
+                    assignin('base','g_episode_num', g);
+                else
+                    assignin('base','g_episode_num', 0);
+                end
+            catch
+                assignin('base','g_episode_num', 0);
+            end
+        end
+
+        env.ResetFcn = @reset_episode_counter;
 
         initial_agent = [];
         if ~isempty(agent_var_name)

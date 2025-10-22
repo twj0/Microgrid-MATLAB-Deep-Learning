@@ -1,4 +1,4 @@
-﻿%% 微电网仿真数据生成脚本
+%% 微电网仿真数据生成脚本
 % =========================================================================
 % 功能: 生成光伏出力、可变负载和电价曲线数据
 % 用途: 为Simulink微电网模型提供输入数据
@@ -196,38 +196,47 @@ price_min = min(price_array);
 price_max = max(price_array);
 unique_prices = unique(price_array);
 unique_seasons = unique(season_tags);
+price_sorted = sort(unique_prices);
+price_mid = NaN;
+if numel(price_sorted) >= 3
+    price_mid = price_sorted(2);
+end
 
 season_display = unique_seasons;
 for idx = 1:numel(season_display)
     if strcmp(season_display{idx}, 'summer')
-        season_display{idx} = '夏季 (Summer)';
+        season_display{idx} = 'Summer';
     else
-        season_display{idx} = '冬季 (Winter)';
+        season_display{idx} = 'Winter';
     end
 end
 
 switch upper(tou_plan)
     case 'E-TOU-C'
-        peak_window_desc = '16:00-21:00 (每日)';
+        peak_window_desc = '16:00-21:00 (Daily)';
     case 'E-TOU-D'
-        peak_window_desc = '17:00-20:00 (工作日)';
+        peak_window_desc = '17:00-20:00 (Weekdays)';
     otherwise
-        peak_window_desc = '自定义';
+        peak_window_desc = 'Custom';
 end
 
 if tier_level == 1
-    tier_desc = '基础阶梯 (Below Baseline)';
+    tier_desc = 'Below Baseline';
 else
-    tier_desc = '超基阶梯 (Above Baseline)';
+    tier_desc = 'Above Baseline';
 end
 
-fprintf('  - 费率方案: PG&E %s\n', tou_plan);
-fprintf('  - 阶梯等级: Tier %d (%s)\n', tier_level, tier_desc);
-fprintf('  - 仿真起始时间: %s\n', char(simulation_start));
-fprintf('  - 涉及季节: %s\n', strjoin(season_display, ', '));
-fprintf('  - 峰段时段: %s\n', peak_window_desc);
-fprintf('  - 价格水平数量: %d\n', numel(unique_prices));
-fprintf('  - 电价范围: $%.3f ~ $%.3f/kWh\n', price_min, price_max);
+fprintf('  - Rate Plan: PG&E %s\n', tou_plan);
+fprintf('  - Tier Level: Tier %d (%s)\n', tier_level, tier_desc);
+fprintf('  - Simulation Start Time: %s\n', char(simulation_start));
+fprintf('  - Involved Seasons: %s\n', strjoin(season_display, ', '));
+fprintf('  - Peak Period: %s\n', peak_window_desc);
+fprintf('  - Number of Price Levels: %d\n', numel(unique_prices));
+fprintf('  - Price Range: $%.3f ~ $%.3f/kWh\n', price_min, price_max);
+fprintf('  - Price List: %s\n', strjoin(compose('$%.3f', price_sorted.'), ', '));
+if ~isnan(price_mid)
+    fprintf('  - Mid-level Price: $%.3f/kWh\n', price_mid);
+end
 
 %% 5. 电池特性查找表 (Look-up Tables)
 % =========================================================================
@@ -374,40 +383,44 @@ vis_days = simulation_days;  % 显示全部30天
 vis_hours = vis_days * 24;
 time_vis = time_hours(1:vis_hours);
 
-% 子图1: 光伏出力
+% Subplot 1: PV output
 subplot(3,1,1);
 plot(time_vis, pv_power(1:vis_hours)/1000, 'b-', 'LineWidth', 1.5);
-xlabel('时间 (小时)');
-ylabel('光伏出力 (kW)');
-title(sprintf('光伏发电功率曲线 (%d天)', vis_days));
+xlabel('Time (hours)');
+ylabel('PV Power (kW)');
+title(sprintf('PV Generation Profile (%d days)', vis_days));
 grid on;
 xlim([0, vis_hours]);
 ylim([0, max(pv_power)/1000*1.1]);
 
-% 子图2: 负载功率
+% Subplot 2: Load power
 subplot(3,1,2);
 plot(time_vis, load_power(1:vis_hours)/1000, 'r-', 'LineWidth', 1.5);
-xlabel('时间 (小时)');
-ylabel('负载功率 (kW)');
-title(sprintf('负载功率曲线 (%d天)', vis_days));
+xlabel('Time (hours)');
+ylabel('Load Power (kW)');
+title(sprintf('Load Demand Profile (%d days)', vis_days));
 grid on;
 xlim([0, vis_hours]);
 ylim([0, max(load_power)/1000*1.1]);
 
-% 子图3: 电价
+% Subplot 3: Electricity price
 subplot(3,1,3);
 stairs(time_vis, price_data(1:vis_hours), 'k-', 'LineWidth', 1.5);
-xlabel('时间 (小时)');
-ylabel('电价 ($/kWh)');
-title(sprintf('PG&E %s 分时电价 (Tier %d, %d天)', tou_plan, tier_level, vis_days));
+xlabel('Time (hours)');
+ylabel('Price ($/kWh)');
+title(sprintf('PG&E %s Time-of-Use Price (Tier %d, %d days)', tou_plan, tier_level, vis_days));
 grid on;
 xlim([0, vis_hours]);
 ylim([0, price_max*1.2]);
 
 hold on;
-yline(price_max, '--r', sprintf('峰段 %s | $%.3f/kWh', peak_window_desc, price_max), ...
+if ~isnan(price_mid)
+    yline(price_mid, '--g', sprintf('Shoulder price $%.3f/kWh', price_mid), ...
+          'LineWidth', 1, 'LabelHorizontalAlignment', 'left');
+end
+yline(price_max, '--r', sprintf('Super-peak (%s) | $%.3f/kWh', peak_window_desc, price_max), ...
       'LineWidth', 1, 'LabelHorizontalAlignment', 'left');
-yline(price_min, '--b', sprintf('最低电价 $%.3f/kWh', price_min), ...
+yline(price_min, '--b', sprintf('Off-peak minimum $%.3f/kWh', price_min), ...
       'LineWidth', 1, 'LabelHorizontalAlignment', 'left');
 hold off;
 
@@ -470,19 +483,12 @@ tf = (day_idx == 1) || (day_idx == 7);
 end
 
 function price = compute_tou_price(hour_of_day, season, tier, plan, is_weekend)
-% compute_tou_price 计算PG&E分时电价
-%   hour_of_day: 0-23小时
-%   season: 'summer' 或 'winter'
-%   tier: 1 (Below Baseline) / 2 (Above Baseline)
-%   plan: 'E-TOU-C' 或 'E-TOU-D'
-%   is_weekend: 逻辑值, 指示是否为周末
-
 hour_idx = mod(floor(hour_of_day), 24);
-season = lower(char(season));
-plan = upper(char(plan));
+season = char(season);
+plan = char(plan);
 
-if ~ismember(season, {'summer', 'winter'})
-    error('season must be ''summer'' or ''winter''.');
+if ~strcmpi(season, 'summer')
+    error('当前仿真仅支持夏季费率。');
 end
 if ~ismember(tier, [1, 2])
     error('tier must be 1 or 2.');
@@ -491,29 +497,38 @@ if nargin < 5
     is_weekend = false;
 end
 
-switch plan
-    case 'E-TOU-C'
-        is_peak = (hour_idx >= 16) && (hour_idx < 21);  % 每日 4-9 PM
-        if strcmp(season, 'summer')
-            prices = [0.39, 0.49; 0.51, 0.61];
-        else
-            prices = [0.36, 0.46; 0.39, 0.49];
-        end
-    case 'E-TOU-D'
-        if is_weekend
-            is_peak = false;  % 周末按全时段非峰
-        else
-            is_peak = (hour_idx >= 17) && (hour_idx < 20);  % 工作日 5-8 PM
-        end
-        if strcmp(season, 'summer')
-            prices = [0.39, 0.43; 0.49, 0.56];
-        else
-            prices = [0.36, 0.43; 0.46, 0.47];
-        end
-    otherwise
-        error('Unsupported plan %s. Use ''E-TOU-C'' or ''E-TOU-D''.', plan);
+persistent summer_rates
+if isempty(summer_rates)
+    summer_rates.E_TOU_C.offpeak    = [0.39073, 0.49157];
+    summer_rates.E_TOU_C.shoulder   = [0.45100, 0.55200];
+    summer_rates.E_TOU_C.super_peak = [0.51373, 0.61457];
+    summer_rates.E_TOU_D.offpeak    = 0.42662;
+    summer_rates.E_TOU_D.shoulder   = 0.49400;
+    summer_rates.E_TOU_D.super_peak = 0.56158;
 end
 
-row_idx = 1 + is_peak;  % 1: Off-peak, 2: Peak
-price = prices(row_idx, tier);
+if strcmpi(plan, 'E-TOU-C')
+    tier_idx = tier;
+    if (hour_idx >= 16) && (hour_idx < 20)
+        price = summer_rates.E_TOU_C.super_peak(tier_idx);
+    elseif ((hour_idx >= 12) && (hour_idx < 16)) || ((hour_idx >= 20) && (hour_idx < 22))
+        price = summer_rates.E_TOU_C.shoulder(tier_idx);
+    else
+        price = summer_rates.E_TOU_C.offpeak(tier_idx);
+    end
+elseif strcmpi(plan, 'E-TOU-D')
+    if is_weekend
+        price = summer_rates.E_TOU_D.offpeak;
+    else
+        if (hour_idx >= 17) && (hour_idx < 20)
+            price = summer_rates.E_TOU_D.super_peak;
+        elseif ((hour_idx >= 14) && (hour_idx < 17)) || ((hour_idx >= 20) && (hour_idx < 22))
+            price = summer_rates.E_TOU_D.shoulder;
+        else
+            price = summer_rates.E_TOU_D.offpeak;
+        end
+    end
+else
+    error('Unsupported plan %s. Use ''E-TOU-C'' or ''E-TOU-D''.', plan);
+end
 end

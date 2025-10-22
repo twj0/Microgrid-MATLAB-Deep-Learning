@@ -23,9 +23,9 @@ cfg.usePriorityReplay = get_option(options, 'usePriorityReplay', true);
 cfg.priorityExponent = get_option(options, 'priorityExponent', 0.6);
 cfg.prioritySmoothingFactor = get_option(options, 'prioritySmoothingFactor', 1e-3);
 cfg.gradientThreshold = get_option(options, 'gradientThreshold', 1);
-cfg.epsilon = get_option(options, 'epsilon', 0.4);
+cfg.epsilon = get_option(options, 'epsilon', 0.6);        % 提升初始探索率
 cfg.epsilonMin = get_option(options, 'epsilonMin', 0.1);
-cfg.epsilonDecay = get_option(options, 'epsilonDecay', 1e-4);
+cfg.epsilonDecay = get_option(options, 'epsilonDecay', 5e-5); % 放缓衰减速度
 rewardMonitorInterval = max(1, get_option(options, 'rewardMonitorInterval', 50));
 rewardMonitorIncrement = get_option(options, 'rewardMonitorIncrement', 1);
 reviewerSchedule = configure_matlab_reviewer_schedule(options, rewardMonitorInterval, rewardMonitorIncrement);
@@ -71,20 +71,32 @@ ensure_run_manager_on_path();
 run_best_manager('init');
 
 t_start = tic;
+    % 在训练开始前初始化全局回合计数器（确保 Simulink 模型可以读取）
+    if ~evalin('base', 'exist(''g_episode_num'', ''var'')')
+        assignin('base', 'g_episode_num', 0);
+    end
+
 try
-    stats = train(agent, env, train_opts);
-    train_time = toc(t_start);
-    training_summary = summarize_training(stats, train_time, maxEpisodes);
-    results = training_summary;
+    % 新增开关：逐回合训练 + 实时最优保存（默认 false，可由外部开启）
+    saveBestFlag = get_option(options, 'saveBestDuringTraining', false);
+    if saveBestFlag
+        [agent, results] = train_with_online_best_saving(agent, env, train_opts, maxEpisodes, maxSteps);
+        train_time = results.training_time; % 由辅助函数内部统计
+    else
+        stats = train(agent, env, train_opts);
+        train_time = toc(t_start);
+        training_summary = summarize_training(stats, train_time, maxEpisodes);
+        results = training_summary;
+    end
     results.reviewer_schedule = reviewerSchedule;
     results.reward_monitor = compute_reward_monitor(results.episode_rewards, reviewerSchedule);
     [results.best_total_reward, results.best_total_episode] = derive_best_total_reward(results.reward_monitor);
     plot_reward_monitor(results.reward_monitor);
     assignin('base', 'dqn_reward_monitor', results.reward_monitor);
     fprintf('\n✓ DQN训练完成\n');
-    fprintf('  - 总回合: %d\n', training_summary.total_episodes);
-    fprintf('  - 最佳奖励: %.1f\n', training_summary.best_reward);
-    fprintf('  - 平均奖励: %.1f\n', training_summary.average_reward);
+    fprintf('  - 总回合: %d\n', results.total_episodes);
+    fprintf('  - 最佳奖励: %.1f\n', results.best_reward);
+    fprintf('  - 平均奖励: %.1f\n', results.average_reward);
 catch ME
     train_time = toc(t_start);
     fprintf('\n✗ DQN训练失败: %s\n', ME.message);
@@ -143,8 +155,9 @@ critic = build_critic(obs_info, act_info, cfg.layerSizes, cfg.learnRate);
 agent_opts = rlDQNAgentOptions;
 agent_opts.SampleTime = cfg.sampleTime;
 agent_opts.UseDoubleDQN = cfg.useDoubleDQN;
+agent_opts.TargetUpdateMethod   = "Periodic";
 agent_opts.TargetUpdateFrequency = cfg.targetUpdateFrequency;
-agent_opts.TargetSmoothFactor = cfg.targetSmoothFactor;
+% 移除 TargetSmoothFactor 以避免与周期更新混用
 agent_opts.ExperienceBufferLength = cfg.experienceBufferLength;
 agent_opts.MiniBatchSize = cfg.miniBatchSize;
 agent_opts.DiscountFactor = cfg.discountFactor;
@@ -389,7 +402,8 @@ if nargin < 2 || isempty(reviewerSchedule)
 end
 monitor.interval = reviewerSchedule.interval;
 monitor.increment = reviewerSchedule.increment;
-monitor.stages = reviewerSchedule.stages;
+monitor.stageBoundaries = reviewerSchedule.stageBoundaries; % 修复字段名：使用实际返回的阶段边界
+monitor.stageWeights = reviewerSchedule.stageWeights;     % 修复字段名：使用实际返回的阶段权重
 monitor.schedule = reviewerSchedule;
 if isempty(episode_rewards)
     monitor.episodes = [];
@@ -555,6 +569,60 @@ catch ME
         delete(tempPath);
     end
 end
+end
+
+
+function [agent, results] = train_with_online_best_saving(agent, env, base_opts, maxEpisodes, maxSteps)
+% 实时最优保存：逐回合训练，超过历史最优即保存（仅保留一个最优模型）
+    bestReward = -inf;
+    allRewards = [];
+    t_start_local = tic;
+    % 初始化全局回合计数器，供奖励函数读取（向后兼容：无影响）
+    assignin('base','g_episode_num',0);
+
+    for ep = 1:maxEpisodes
+        % 每回合开始前写入当前回合号到 base workspace
+        assignin('base','g_episode_num', ep);
+        %  Episode Reset 
+        fprintf('[ResetFcn] Episode %d reset at %s\n', ep, char(datetime('now','Format','HH:mm:ss')));
+        opts = base_opts;
+        try, opts.StopTrainingCriteria = 'EpisodeCount'; catch, end
+        opts.StopTrainingValue = 1;
+        opts.Plots = 'none';
+
+        stats = train(agent, env, opts);
+        if isfield(stats, 'EpisodeReward')
+            r = double(stats.EpisodeReward(end));
+            % 防御：将NaN/Inf回报降级为大负值，避免污染best/avg统计
+            if ~isfinite(r)
+                warning('DQN:InvalidEpisodeReward','Episode %d returned invalid reward: %g, fallback to -1e6', ep, r);
+                r = -1e6;
+            end
+        else
+            r = -1e6; % 没有回报字段时给予严厉惩罚，确保统计稳定
+        end
+        allRewards(end+1) = r; %#ok<AGROW>
+
+        if r > bestReward
+            bestReward = r;
+            try
+                episodeData = extract_best_episode([], agent, env, maxSteps);
+                tmp = struct('episode_rewards', allRewards, 'best_reward', bestReward, ...
+                             'total_episodes', numel(allRewards), 'average_reward', mean(allRewards), ...
+                             'training_time', toc(t_start_local));
+                run_best_manager('save', agent, tmp, episodeData);
+            catch ME
+                fprintf('⚠ DQN online save failed: %s\n', ME.message);
+            end
+        end
+    end
+
+    results = struct();
+    results.episode_rewards = allRewards;
+    results.best_reward = bestReward;
+    results.total_episodes = numel(allRewards);
+    results.average_reward = mean(allRewards);
+    results.training_time = toc(t_start_local);
 end
 
 function name = get_algorithm_name_from_path(algorithm_dir)

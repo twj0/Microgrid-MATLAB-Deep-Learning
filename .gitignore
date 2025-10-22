@@ -6,13 +6,18 @@
 *.slxc
 # results文件夹
 results/
-
+.cursor/
+# old 文件
+*.old
 # archived文件夹,model-backup文件夹,project_docment文件夹
 archived/
 model-backup/
 project_document/
 prompt/ 
 todo/
+latex/
+.augment/
+logs/
 # 仿真后的agents和slprj
 matlab/ddpg/savedAgents/
 model/slprj/
@@ -24,8 +29,22 @@ matlab/ddpg/model_backup/
 matlab/ddpg/results/
 # matlab文件夹中的一些备份文件
 matlab/ddpg/*.m.backup
+*.m.backup
+matlab\src\reward\calculate_economic_reward.m.backup
 warp.md
 matlab/ddpg/main.m.backup
 matlab/ddpg/train_model.m.backup
 matlab/ddpg/MERGE_SUMMARY.md
 model/Microgrid.slx.autosave
+
+# windsurf文件夹
+.windsurf/
+# openspec文件夹
+openspec/
+
+path/
+AGENTS.md
+matlab/DRL/ddpg/MERGE_SUMMARY.md
+matlab/DRL/ddpg/PROJECT.md
+matlab/DRL/ddpg/README.md
+matlab/DRL/sac/README_BEST_RUN.md

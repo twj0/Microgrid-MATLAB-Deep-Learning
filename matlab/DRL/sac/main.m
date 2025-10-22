@@ -33,6 +33,30 @@ function main(options)
 
         [env, agent_var_name] = setup_simulink_environment(config);
         fprintf('✓ Simulink环境配置完成\n');
+        % Initialize episode counter parameter for the positive critic reward
+        try
+            exists_flag = evalin('base','exist(''g_episode_num'',''var'')');
+        catch
+            exists_flag = 0;
+        end
+        if ~exists_flag
+            g_episode_num = Simulink.Parameter(0);
+            g_episode_num.CoderInfo.StorageClass = 'ExportedGlobal';
+            assignin('base','g_episode_num', g_episode_num);
+        else
+            try
+                g = evalin('base','g_episode_num');
+                if isa(g,'Simulink.Parameter')
+                    g.Value = 0;
+                    assignin('base','g_episode_num', g);
+                else
+                    assignin('base','g_episode_num', 0);
+                end
+            catch
+                assignin('base','g_episode_num', 0);
+            end
+        end
+
 
         initial_agent = [];
         if ~isempty(agent_var_name)
@@ -273,7 +297,8 @@ function [env, agent_var_name] = setup_simulink_environment(config)
     agent_var_name = ensure_agent_variable(agent_block, obs_info, act_info, config.sample_time);
 
     env = rlSimulinkEnv(config.model_name, agent_block, obs_info, act_info);
-    env.ResetFcn = @(in)setVariable(in, 'initial_soc', 50);
+    % Use a reset function that increments episode counter and exposes it to the model
+    env.ResetFcn = @reset_episode_counter;
 end
 
 function save_results(agent, results, config, agent_var_name)
@@ -639,12 +664,12 @@ function agent = build_sac_agent(obs_info, act_info, cfg)
 
     agent_opts = rlSACAgentOptions();
     agent_opts.SampleTime = cfg.sampleTime;
-    agent_opts.TargetSmoothFactor = 1e-2;  % 增加平滑因子
-    agent_opts.DiscountFactor = 0.99;
+    agent_opts.TargetSmoothFactor = 3e-3;  % 降低Tau，目标网络更稳
+    agent_opts.DiscountFactor = 0.985;  % 略降Gamma增强稳定性
     agent_opts.ExperienceBufferLength = 1e6;
-    agent_opts.MiniBatchSize = 128;
+    agent_opts.MiniBatchSize = 256;  % 增大Batch，降低梯度方差（若显存允许）
     agent_opts.EntropyWeightOptions.TargetEntropy = cfg.targetEntropy;
-    agent_opts.EntropyWeightOptions.LearnRate = 1e-3;  % 添加熵权重学习率
+    agent_opts.EntropyWeightOptions.LearnRate = 3e-4;  % 降低Alpha学习率，防止震荡
 
     call_attempts = {
         {actor, [critic1, critic2], agent_opts};
@@ -709,7 +734,7 @@ function actor = build_actor(obs_info, act_info, layer_sizes)
     lg = addLayers(lg, std_scale);
     lg = connectLayers(lg, 'action_std_softplus', 'action_std_scale');
 
-    actor_opts = rlRepresentationOptions('LearnRate', 3e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');
+    actor_opts = rlRepresentationOptions('LearnRate', 1e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');  % Actor LR 
     mean_name = 'action_mean_fc';
     std_name = 'action_std_scale';
     actor = instantiate_gaussian_actor(lg, obs_info, act_info, mean_name, std_name, actor_opts);
@@ -749,7 +774,7 @@ function critic = build_critic(obs_info, act_info, layer_sizes, suffix)
     critic_lg = addLayers(critic_lg, fullyConnectedLayer(1, 'Name', ['q_value_' suffix]));
     critic_lg = connectLayers(critic_lg, prev, ['q_value_' suffix]);
 
-    critic_opts = rlRepresentationOptions('LearnRate', 3e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');
+    critic_opts = rlRepresentationOptions('LearnRate', 2e-4, 'GradientThreshold', 1, 'UseDevice', 'cpu');  % Critic LR 
     critic = instantiate_qvalue_representation(critic_lg, obs_info, act_info, ...
         ['state_' suffix], ['action_' suffix], critic_opts);
 end
@@ -836,6 +861,23 @@ function critic = instantiate_qvalue_representation(lg, obs_info, act_info, obs_
     end
 
     error('SAC:MissingQValueAPI', '当前MATLAB版本不支持创建Q-value表示，请升级强化学习工具箱。');
+end
+
+function in = reset_episode_counter(in)
+% reset function called at the start of each episode by rlSimulinkEnv
+% It increments an internal episode counter and exposes it to the model
+% via variable 'g_episode_num'.
+persistent ep
+if isempty(ep)
+    ep = 0;
+end
+ep = ep + 1;
+% DIAG: print to command window to verify ResetFcn is called per episode
+fprintf('[ResetFcn] Episode %d reset at %s\n', ep, datestr(now,'HH:MM:SS'));
+% keep any other reset-time variables in one place
+in = setVariable(in, 'initial_soc', 50);
+% expose current episode index to Simulink model for this episode run
+in = setVariable(in, 'g_episode_num', ep);
 end
 
 function value = get_option(options, field, default_value)

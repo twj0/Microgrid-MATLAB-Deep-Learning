@@ -13,7 +13,7 @@ function [agent, results] = train_model(env, initial_agent, options)
     cfg.criticLayerSizes = get_option(options, 'criticLayerSizes', [256 128 64]);
     cfg.sampleTime = get_option(options, 'sampleTime', 3600);
     action_span = act_info.UpperLimit - act_info.LowerLimit;
-    cfg.stdScale = get_option(options, 'stdScale', min(action_span / 2 * 0.05, 500));
+    cfg.stdScale = get_option(options, 'stdScale', min(action_span / 2 * 0.10, 1000)); % 提高策略标准差初值，增强探索
 
     maxEpisodes = get_option(options, 'maxEpisodes', 2000);
     maxSteps = get_option(options, 'maxSteps', 720);
@@ -56,15 +56,29 @@ function [agent, results] = train_model(env, initial_agent, options)
     run_best_manager('init');
 
     t_start = tic;
+    % 在训练开始前初始化全局回合计数器（确保 Simulink 模型等可读取）
+    if ~evalin('base', 'exist(''g_episode_num'', ''var'')')
+        assignin('base', 'g_episode_num', 0);
+    end
+
     try
-        stats = train(agent, env, train_opts);
-        train_time = toc(t_start);
-        training_summary = summarize_training(stats, train_time, maxEpisodes);
-        results = training_summary;
+        % 新增开关：逐回合训练+实时最优保存（默认 false，可由外部开启）
+        saveBestFlag = get_option(options, 'saveBestDuringTraining', false);
+        useAdaptiveEntropy = get_option(options, 'useAdaptiveEntropy', true); % 默认开启自适应熵，防止策略分布过早收缩
+        entropyAdjustEvery = get_option(options, 'entropyAdjustEvery', 100); % 调整频率为100，平衡稳定与探索
+        if saveBestFlag
+            [agent, results] = train_with_online_best_saving(agent, env, train_opts, maxEpisodes, maxSteps, useAdaptiveEntropy, entropyAdjustEvery);
+            train_time = results.training_time; % 由辅助函数内部统计
+        else
+            stats = train(agent, env, train_opts);
+            train_time = toc(t_start);
+            training_summary = summarize_training(stats, train_time, maxEpisodes);
+            results = training_summary;
+        end
         fprintf('\n✓ PPO training completed\n');
-        fprintf('  - Episodes: %d\n', training_summary.total_episodes);
-        fprintf('  - Best reward: %.1f\n', training_summary.best_reward);
-        fprintf('  - Average reward: %.1f\n', training_summary.average_reward);
+        fprintf('  - Episodes: %d\n', results.total_episodes);
+        fprintf('  - Best reward: %.1f\n', results.best_reward);
+        fprintf('  - Average reward: %.1f\n', results.average_reward);
     catch ME
         train_time = toc(t_start);
         fprintf('\n✗ PPO training failed: %s\n', ME.message);
@@ -129,7 +143,7 @@ function agent = create_ppo_agent(obs_info, act_info, cfg)
     agent_opts.DiscountFactor = 0.99;
     agent_opts.GAEFactor = 0.95;
     agent_opts.AdvantageEstimateMethod = "gae";
-    agent_opts.EntropyLossWeight = 0.01;
+    agent_opts.EntropyLossWeight = 0.02; % 略增熵权重，增强探索避免策略塌缩
 
     call_attempts = {
         {actor, critic, agent_opts};
@@ -411,4 +425,81 @@ function value = get_option(options, field, default_value)
     else
         value = default_value;
     end
+end
+
+function [agent, results] = train_with_online_best_saving(agent, env, base_opts, maxEpisodes, maxSteps, useAdaptiveEntropy, entropyAdjustEvery)
+    % 逐回合训练并在回合奖励超过历史最优时实时保存（仅保留一个最优模型）
+    if nargin < 6, useAdaptiveEntropy = true; end  % 默认自适应熵开启
+    if nargin < 7, entropyAdjustEvery = 100; end % 默认每100回合调整一次
+    minEntropyW = 1e-4; maxEntropyW = 5e-2; % 熵权重上下限
+
+    bestReward = -inf;
+    allRewards = [];
+    t_start_local = tic;
+    % 初始化全局回合计数器，供奖励函数读取（向后兼容：无影响）
+    assignin('base','g_episode_num',0);
+
+    for ep = 1:maxEpisodes
+        % 每回合开始前写入当前回合号到 base workspace
+        assignin('base','g_episode_num', ep);
+        % 统一的 Episode Reset 日志输出（不改变外部接口）
+        fprintf('[ResetFcn] Episode %d reset at %s\n', ep, char(datetime('now','Format','HH:mm:ss')));
+        opts = base_opts;
+        try
+            opts.StopTrainingCriteria = 'EpisodeCount';
+        catch
+        end
+        opts.StopTrainingValue = 1;
+        opts.Plots = 'training-progress';
+
+        stats = train(agent, env, opts);
+        if isfield(stats, 'EpisodeReward')
+            r = double(stats.EpisodeReward(end));
+        else
+            r = NaN;
+        end
+        allRewards(end+1) = r; %#ok<AGROW>
+
+        %  
+        if useAdaptiveEntropy && ep >= entropyAdjustEvery && mod(ep, entropyAdjustEvery) == 0
+            try
+                recent = allRewards(max(1, end-entropyAdjustEvery+1):end);
+                prev   = allRewards(max(1, end-2*entropyAdjustEvery+1):max(1, end-entropyAdjustEvery));
+                if ~isempty(prev)
+                    w = agent.AgentOptions.EntropyLossWeight;
+                    if mean(recent) > mean(prev) + 1e-6
+                        w = max(minEntropyW, 0.9*w); % 
+                    else
+                        w = min(maxEntropyW, 1.1*w); % 
+                    end
+                    agent.AgentOptions.EntropyLossWeight = w;
+                end
+            catch
+                % 
+            end
+        end
+
+        if r > bestReward
+            bestReward = r;
+            try
+                episodeData = extract_best_episode([], agent, env, maxSteps);
+                tmp = struct();
+                tmp.episode_rewards = allRewards;
+                tmp.best_reward = bestReward;
+                tmp.total_episodes = numel(allRewards);
+                tmp.average_reward = mean(allRewards);
+                tmp.training_time = toc(t_start_local);
+                run_best_manager('save', agent, tmp, episodeData);
+            catch ME
+                fprintf('⚠ PPO online save failed: %s\n', ME.message);
+            end
+        end
+    end
+
+    results = struct();
+    results.episode_rewards = allRewards;
+    results.best_reward = bestReward;
+    results.total_episodes = numel(allRewards);
+    results.average_reward = mean(allRewards);
+    results.training_time = toc(t_start_local);
 end

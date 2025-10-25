@@ -33,6 +33,7 @@ function visualization(options)
     opts.figureFormat   = lower(char(get_option(options, 'figureFormat', 'png')));
     opts.closeAfterSave = logical(get_option(options, 'closeAfterSave', true));
     opts.timestamp      = char(get_option(options, 'timestamp', char(datetime('now','Format','yyyyMMdd_HHmmss'))));
+    opts.touDef         = get_option(options, 'touDef', []);
 
 
     % Initialize publication-style defaults
@@ -195,11 +196,20 @@ function visualization(options)
             tt.Battery_SOC = fillmissing(tt.Battery_SOC, 'linear', 'EndValues','nearest');
         end
 
-        % 计算并网购电功率(Grid_Power)，无售电: >=0
+        % 计算并网购电功率(Grid_Power)
         tt.Grid_Power = compute_grid_power(tt.PV_Power, tt.Load_Power, tt.Battery_Power);
 
+        priceSellProfile = fetch_workspace_variable(opts.workspace, ["price_sell_profile","price_sell","Price_Sell"]);
+        if ~isempty(priceSellProfile)
+            [tsell, pSell] = timeseries_to_array(priceSellProfile);
+            ttSell = timetable(baseT0 + hours(tsell), double(pSell(:)), 'VariableNames', {'Price_Sell'});
+            tt = synchronize(tt, ttSell, 'union', 'mean');
+            tt = retime(tt, 'hourly', 'mean');
+            tt.Price_Sell = fillmissing(tt.Price_Sell, 'linear', 'EndValues','nearest');
+        end
+
         % 生成 Fig A–D
-        figA = plot_fig_A_overview(opts, tt, []); if isgraphics(figA), figA.UserData = struct('label','figA_overview'); figures{end+1} = figA; end
+        figA = plot_fig_A_overview(opts, tt, opts.touDef); if isgraphics(figA), figA.UserData = struct('label','figA_overview'); figures{end+1} = figA; end
         figB = plot_fig_B_battery(opts, tt);      if isgraphics(figB), figB.UserData = struct('label','figB_battery');   figures{end+1} = figB; end
         figC = plot_fig_C_grid_exchange(opts, tt);if isgraphics(figC), figC.UserData = struct('label','figC_grid');      figures{end+1} = figC; end
         figD = plot_fig_D_supply_stack(opts, tt); if isgraphics(figD), figD.UserData = struct('label','figD_supply');    figures{end+1} = figD; end
@@ -1153,7 +1163,7 @@ function savedCount = save_figures(figures, opts)
         end
 
         if opts.saveFigures
-            filename = sprintf('%s_%s_%s.png', opts.filePrefix, labelName, opts.timestamp);
+            filename = sprintf('%s_%s_%s.%s', opts.filePrefix, labelName, opts.timestamp, opts.figureFormat);
             filepath = fullfile(opts.outputDir, filename);
             try
                 viz_export(fig, filepath);
@@ -1430,35 +1440,29 @@ set(groot,'defaultFigureColor','w');
 end
 
 function viz_export(fig, filepath)
-% Unified PNG export at 300 dpi (journal-ready bitmap)
 [p,n,ext] = fileparts(filepath);
-if isempty(ext) || ~strcmpi(ext,'.png')
-    filepath = fullfile(p, [n '.png']);
+if isempty(ext)
+    ext = '.png';
+    filepath = fullfile(p, [n ext]);
 end
-% [0m[0m[0m[0m
-%  [0m[0m[0m[0m[0m
-%  [0m[0m[0m[0m[0m
-%  [0m[0m[0m[0m[0m
-%  [0m[0m[0m[0m[0m
-%  [0m[0m[0m[0m[0m
-% [0m[0m[0m[0m
-% [0m[0m[0m[0m
-% [0m[0m[0m[0m
-% [0m[0m[0m[0m
-% [0m[0m[0m[0m
-% [0m[0m[0m[0m
-% [0m[0m[0m[0m
-% [0m[0m[0m[0m
 if ~exist(p, 'dir')
     mkdir(p);
 end
 try
-    %  [0m[0m[0m[0m[0m
-    if exist('exportgraphics','file') == 2
-        exportgraphics(fig, filepath, 'Resolution', 300, 'BackgroundColor', 'white');
-    else
-        set(fig, 'PaperPositionMode', 'auto');
-        print(fig, filepath, '-dpng', '-r300');
+    switch lower(ext)
+        case {'.png','.jpg','.jpeg','.tif','.tiff'}
+            if exist('exportgraphics','file') == 2
+                exportgraphics(fig, filepath, 'Resolution', 300, 'BackgroundColor', 'white');
+            else
+                set(fig, 'PaperPositionMode', 'auto');
+                print(fig, filepath, '-dpng', '-r300');
+            end
+        otherwise
+            if exist('exportgraphics','file') == 2
+                exportgraphics(fig, filepath, 'ContentType', 'vector', 'BackgroundColor', 'white');
+            else
+                error('viz_export:saveFailed', 'exportgraphics not available for vector output');
+            end
     end
 catch ME
     error('viz_export:saveFailed', '%s', ME.message);
@@ -1513,8 +1517,7 @@ function [p_batt_norm, p_grid_norm] = normalize_signs(p_batt, p_grid)
 %NORMALIZE_SIGNS Enforce sign convention: batt charge>0, grid import>0.
     p_batt_norm = double(p_batt(:));
     p_grid_norm = double(p_grid(:));
-    % Project prohibits selling to grid currently
-    p_grid_norm = max(p_grid_norm, 0);
+    p_grid_norm = p_grid_norm;
 end
 
 function p_grid = compute_grid_power(pv, loadp, p_batt)
@@ -1525,7 +1528,7 @@ function p_grid = compute_grid_power(pv, loadp, p_batt)
     n = min([numel(pv), numel(loadp), numel(p_batt)]);
     pv = pv(1:n); loadp = loadp(1:n); p_batt = p_batt(1:n);
     p_grid = loadp - pv - p_batt;
-    p_grid = max(p_grid, 0);
+    p_grid = p_grid;
 end
 
 function viz_tou_shading(ax, touDef)
@@ -2097,7 +2100,7 @@ function fig = plot_fig_A_overview(opts, tt, touDef)
     ax = axes(fig); hold(ax, 'on');
     n = min(24, height(tt));
     if n < 2
-        axis(ax, 'off'); text(0.5,0.5,'数据不足','Units','normalized','HorizontalAlignment','center'); return; %#ok<UNRCH>
+        axis(ax, 'off'); text(0.5,0.5,'数据不足','Units','normalized','HorizontalAlignment','center'); return; 
     end
     t = (1:n)';
     viz_tou_shading(ax, touDef);
@@ -2107,9 +2110,17 @@ function fig = plot_fig_A_overview(opts, tt, touDef)
     ylabel(ax, 'Power (kW)');
     yyaxis(ax, 'right');
     plot(ax, t, tt.Price_Buy(1:n), '--', 'Color', [0.85, 0.33, 0.1], 'LineWidth', 1.5, 'DisplayName', 'Price (buy)');
+    hasSell = any(strcmp('Price_Sell', tt.Properties.VariableNames)) && any(~isnan(tt.Price_Sell(1:n)));
+    if hasSell
+        plot(ax, t, tt.Price_Sell(1:n), ':', 'Color', [0.2, 0.2, 0.2], 'LineWidth', 1.2, 'DisplayName', 'Price (sell)');
+    end
     ylabel(ax, 'Price ($/kWh)');
     xlabel(ax, 'Hour');
-    legend(ax, {'Load','PV','Price (buy)'}, 'Location', 'northwest');
+    if hasSell
+        legend(ax, {'Load','PV','Price (buy)','Price (sell)'}, 'Location', 'northwest');
+    else
+        legend(ax, {'Load','PV','Price (buy)'}, 'Location', 'northwest');
+    end
     title(ax, 'PV/Load vs TOU Price (Daily)'); grid(ax, 'on');
 end
 
@@ -2129,7 +2140,7 @@ function fig = plot_fig_B_battery(opts, tt)
     ax2 = nexttile; hold(ax2, 'on');
     if any(strcmp('Battery_SOC', tt.Properties.VariableNames)) && any(~isnan(tt.Battery_SOC))
         soc = tt.Battery_SOC(1:n);
-        plot(ax2, t, soc, 'LineWidth', 2, 'Color', [0.2,0.2,0.2]);
+        stairs(ax2, t, soc, 'LineWidth', 2, 'Color', [0.2,0.2,0.2]);
         yline(ax2, [0.2 0.9], '--', 'Color', [0.5,0.5,0.5]);
         ylim(ax2, [0 1]); ylabel(ax2, 'SOC (pu)');
     else
@@ -2144,13 +2155,14 @@ function fig = plot_fig_C_grid_exchange(opts, tt)
     ax = axes(fig); hold(ax, 'on');
     n = min(24, height(tt)); t = (1:n)';
     if any(strcmp('Grid_Power', tt.Properties.VariableNames))
-        p_grid = max(tt.Grid_Power(1:n), 0);
+        p_grid = tt.Grid_Power(1:n);
     else
         p_grid = compute_grid_power(tt.PV_Power(1:n), tt.Load_Power(1:n), tt.Battery_Power(1:n));
     end
-    area(ax, t, p_grid, 'FaceAlpha', 0.6, 'FaceColor', [0.3, 0.5, 0.8], 'EdgeColor','none');
+    A1 = area(ax, t, max(p_grid,0)); set(A1,'FaceAlpha',0.6,'FaceColor',[0.3,0.5,0.8],'EdgeColor','none');
+    A2 = area(ax, t, min(p_grid,0)); set(A2,'FaceAlpha',0.6,'FaceColor',[0.6,0.8,0.6],'EdgeColor','none');
     yline(ax, 0, 'k-'); ylabel(ax, 'Power (kW)'); xlabel(ax, 'Hour');
-    legend(ax, {'Grid Import (+)'}, 'Location', 'northwest'); grid(ax, 'on');
+    legend(ax, {'Import (+)','Export (-)'}, 'Location', 'northwest'); grid(ax, 'on');
 end
 
 function fig = plot_fig_D_supply_stack(opts, tt)

@@ -85,9 +85,296 @@ function episodeData = extract_best_episode(simOut, agent, env, maxSteps)
 
         fprintf('  ⏱ 这可能需要几分钟时间...\n');
 
-        simOpts = rlSimulationOptions('MaxSteps', maxSteps, 'UseParallel', false);
-        simOut = sim(env, agent, simOpts);
-        episodeData = extract_from_simout_clean_v2(simOut);
+        % 方案A（主路径）：两输出 sim(env,agent) 获取 simInfo.SimulationOutput
+        try
+            simOpts = rlSimulationOptions('MaxSteps', maxSteps, 'UseParallel', false);
+            fprintf('  路径A: sim(env,agent) 双输出以获取 SimulationOutput...\n');
+            [~, simInfo] = sim(env, agent, simOpts);
+            try
+                simOut = simInfo.SimulationOutput;
+            catch
+                error('simInfo 不含 SimulationOutput 字段');
+            end
+            episodeData = extract_from_simout_clean_v2(simOut);
+        catch ME_A
+            % 方案B（兜底）：使用 SimulationInput 进行 model 级仿真，并确保 RL Agent 变量正确注入
+            fprintf('  路径A失败，切换到路径B（model 级 sim）：%s\n', ME_A.message);
+            if isempty(modelName)
+                error('无法推断模型名，且路径A失败，终止提取。');
+            end
+
+            % 定位 RL Agent 块与其参数“Agent”的变量名
+            agentVarName = 'agent';
+            agentBlock = '';
+            try
+                defaultBlk = [modelName '/RL Agent'];
+                get_param(defaultBlk,'Handle');
+                agentBlock = defaultBlk;
+            catch
+                try
+                    blks = find_system(modelName,'FollowLinks','on','LookUnderMasks','all','MaskType','Reinforcement Learning Agent');
+                    if ~isempty(blks)
+                        agentBlock = blks{1};
+                    end
+                catch
+                end
+            end
+            try
+                if ~isempty(agentBlock)
+                    av = get_param(agentBlock,'Agent');
+                    if isstring(av) || ischar(av)
+                        av = strtrim(char(av));
+                        if ~isempty(av)
+                            agentVarName = av;
+                        end
+                    end
+                    fprintf('  路径B: RL Agent 块: %s, Agent 变量名: %s\n', agentBlock, agentVarName);
+                else
+                    fprintf('  路径B: 未定位 RL Agent 块，默认 Agent 变量名: %s\n', agentVarName);
+                end
+            catch MEB1
+                fprintf('  路径B: 读取 RL Agent 参数失败: %s\n', MEB1.message);
+            end
+
+            % 使用 SimulationInput 配置模型参数与变量
+            try
+                if ~bdIsLoaded(modelName), load_system(modelName); end
+            catch
+            end
+            in = Simulink.SimulationInput(modelName);
+            in = setModelParameter(in, 'FastRestart','off', 'ReturnWorkspaceOutputs','on', ...
+                'SignalLogging','on', 'SignalLoggingName','logsout', 'SignalLoggingSaveFormat','Dataset');
+            try
+                in = setVariable(in, agentVarName, agent);
+                if ~strcmp(agentVarName,'agent')
+                    in = setVariable(in, 'agent', agent); % 兼容常见别名
+                end
+            catch MEB2
+                fprintf('  路径B: setVariable(%s) 失败: %s\n', agentVarName, MEB2.message);
+                fprintf('  标识符: %s\n', MEB2.identifier);
+                fprintf('  堆栈:\n');
+                for ii = 1:length(MEB2.stack)
+                    fprintf('    文件: %s, 函数: %s, 行: %d\n', MEB2.stack(ii).file, MEB2.stack(ii).name, MEB2.stack(ii).line);
+                end
+            end
+
+            % 同步写入 base workspace（双重保障）
+            try
+                assignin('base', agentVarName, agent);
+            catch
+                % 忽略写入 base workspace 失败
+            end
+            if ~strcmp(agentVarName,'agent')
+                try
+                    assignin('base','agent',agent);
+                catch
+                    % 忽略写入 base workspace 失败（别名）
+                end
+            end
+
+            fprintf('  路径B: 使用 SimulationInput 运行仿真...\n');
+            % 诊断：打印 SimulationInput.Variables
+            try
+                vars = in.Variables;
+                nVars = numel(vars);
+                fprintf('  路径B: SimulationInput.Variables 数量: %d\n', nVars);
+                if nVars > 0
+                    names = string({vars.Name});
+                    fprintf('  路径B: Variables 名称: %s\n', strjoin(cellstr(names), ', '));
+                    hasAgentVar = any(strcmp(cellstr(names), agentVarName));
+                    fprintf('  路径B: 是否包含 %s? %d\n', agentVarName, hasAgentVar);
+                end
+            catch MEv
+                fprintf('  路径B: 读取 SimulationInput.Variables 失败: %s\n', MEv.message);
+            end
+            % 路径B: 数据源检查与注入（From Workspace/Constant 依赖）
+            try
+                dataFile = fullfile('matlab','src','microgrid_simulation_data.mat');
+                fwBlocks = {
+                    [modelName '/load_power_profile'], ...
+                    [modelName '/price_profile'], ...
+                    [modelName '/pv_power_profile'] ...
+                };
+                for bb = 1:numel(fwBlocks)
+                    blk = fwBlocks{bb};
+                    try
+                        vName = '';
+                        try
+                            vName = char(get_param(blk,'VariableName'));
+                        catch
+                        end
+                        vName = strtrim(vName);
+                        if ~isempty(vName)
+                            fprintf('  路径B: 依赖块: %s, VariableName: %s\n', blk, vName);
+                            % 若 base 不存在，则尝试从数据文件加载并注入
+                            hasBase = 0;
+                            try
+                                hasBase = evalin('base', sprintf('exist(''%s'',''var'')', vName));
+                            catch
+                            end
+                            if ~hasBase
+                                if exist(dataFile,'file') == 2
+                                    try
+                                        S = load(dataFile, vName);
+                                        if isfield(S, vName)
+                                            assignin('base', vName, S.(vName));
+                                            try
+                                                in = setVariable(in, vName, S.(vName));
+                                            catch
+                                            end
+                                            fprintf('    -> 已从数据文件注入 %s (类型: %s)。\n', vName, class(S.(vName)));
+                                        else
+                                            fprintf('    -> 数据文件中未包含变量 %s。\n', vName);
+                                        end
+                                    catch MEld
+                                        fprintf('    -> 加载数据文件变量 %s 失败: %s\n', vName, MEld.message);
+                                    end
+                                else
+                                    fprintf('    -> 未找到数据文件: %s\n', dataFile);
+                                end
+                            end
+                        else
+                            fprintf('  路径B: 依赖块: %s, 未配置 VariableName。\n', blk);
+                        end
+                    catch ME_fw
+                        fprintf('  路径B: 读取 From Workspace 配置失败(%s): %s\n', blk, ME_fw.message);
+                    end
+                end
+                % Constant 块（可能引用变量）
+                constBlk = [modelName '/Hierarchical Reward System/Constant'];
+                try
+                    valStr = char(get_param(constBlk,'Value'));
+                    valStr = strtrim(valStr);
+                    fprintf('  路径B: Constant 块: %s, Value: %s\n', constBlk, valStr);
+                    isNum = ~isnan(str2double(valStr));
+                    if ~isNum
+                        looksVar = isvarname(valStr);
+                        if looksVar
+                            hasBase = 0;
+                            try
+                                hasBase = evalin('base', sprintf('exist(''%s'',''var'')', valStr));
+                            catch
+                            end
+                            if ~hasBase && exist(dataFile,'file') == 2
+                                try
+                                    S2 = load(dataFile, valStr);
+                                    if isfield(S2, valStr)
+                                        assignin('base', valStr, S2.(valStr));
+                                        try
+                                            in = setVariable(in, valStr, S2.(valStr));
+                                        catch
+                                        end
+                                        fprintf('    -> 已从数据文件注入 %s (类型: %s)。\n', valStr, class(S2.(valStr)));
+                                    else
+                                        fprintf('    -> 数据文件中未包含变量 %s。\n', valStr);
+                                        if strcmp(valStr,'g_episode_num')
+                                            try
+                                                assignin('base','g_episode_num',1);
+                                                in = setVariable(in,'g_episode_num',1);
+                                                fprintf('    -> 变量 g_episode_num 不存在，已注入默认值 1（用于单次仿真测试）。\n');
+                            %
+
+                            %
+
+% 
+                            %
+% 
+                            %
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+
+                            %
+%
+% Fallback: ensure g_episode_num default injection if still missing
+                            try
+                                hasBase2 = 0;
+                                try
+                                    hasBase2 = evalin('base', sprintf('exist(''%s'',''var'')', valStr));
+                                catch
+                                end
+                                if ~hasBase2 && strcmp(valStr,'g_episode_num')
+                                    try
+                                        assignin('base','g_episode_num',1);
+                                        in = setVariable(in,'g_episode_num',1);
+                                        fprintf('    -> 变量 g_episode_num 仍缺失，已兜底注入默认值 1（用于单次仿真测试）。\n');
+                                    catch
+                                    end
+                                end
+                            catch
+                            end
+                                            catch
+                                            end
+                                        end
+                                    end
+                                catch MEld2
+                                    fprintf('    -> 加载数据文件变量 %s 失败: %s\n', valStr, MEld2.message);
+                                end
+                            end
+                        else
+                            try
+                                evalin('base', valStr);
+                            catch
+                                fprintf('    -> Constant.Value 看似表达式且无法在 base 解析，请检查。\n');
+                            end
+                        end
+                    end
+                catch MEc
+                    fprintf('  路径B: 读取 Constant 配置失败: %s\n', MEc.message);
+                end
+                % 刷新一次 Variables 列表
+                try
+                    vars = in.Variables;
+                    nVars = numel(vars);
+                    fprintf('  路径B: 注入后 Variables 数量: %d\n', nVars);
+                    if nVars > 0
+                        names = string({vars.Name});
+                        fprintf('  路径B: 注入后 Variables 名称: %s\n', strjoin(cellstr(names), ', '));
+                    end
+                catch
+                end
+            catch MEdat
+                fprintf('  路径B: 数据依赖注入阶段出现异常: %s\n', MEdat.message);
+            end
+
+            try
+                simOut = sim(in);
+            catch ME_B
+                fprintf('  路径B: sim(in) 失败: %s\n', ME_B.message);
+                fprintf('  标识符: %s\n', ME_B.identifier);
+                fprintf('  堆栈:\n');
+                for ii = 1:length(ME_B.stack)
+                    fprintf('    文件: %s, 函数: %s, 行: %d\n', ME_B.stack(ii).file, ME_B.stack(ii).name, ME_B.stack(ii).line);
+                end
+                % 展开 MultipleErrors 异常
+                if strcmp(ME_B.identifier, 'MATLAB:MException:MultipleErrors')
+                    fprintf('\n=== 展开 MultipleErrors（共 %d 个子错误）===\n', length(ME_B.cause));
+                    for jj = 1:length(ME_B.cause)
+                        subME = ME_B.cause{jj};
+                        fprintf('\n--- 子错误 %d/%d ---\n', jj, length(ME_B.cause));
+                        fprintf('  标识符: %s\n', subME.identifier);
+                        fprintf('  消息: %s\n', subME.message);
+                        fprintf('  堆栈:\n');
+                        for kk = 1:length(subME.stack)
+                            fprintf('    文件: %s, 函数: %s, 行: %d\n', subME.stack(kk).file, subME.stack(kk).name, subME.stack(kk).line);
+                        end
+                    end
+                end
+                rethrow(ME_B);
+            end
+            episodeData = extract_from_simout_clean_v2(simOut);
+        end
 
     else
         error('extract_best_episode需要提供simOut或(agent + env)');
@@ -139,7 +426,11 @@ function data = extract_from_simout(simOut)
                 catch
                     e = logsout.get(jj);
                 end
-                try, fprintf('    - %s\n', e.Name); catch, end
+                try
+                    fprintf('    - %s\n', e.Name);
+                catch
+                    % ignore
+                end
             end
         end
 
@@ -157,6 +448,16 @@ end
 
 function data = extract_from_logsout(logsout, data)
     %EXTRACT_FROM_LOGSOUT 从logsout提取信号
+
+    % 暂时关闭 getElement 未命名命中时的啰嗦警告，函数退出自动恢复
+    try
+        warnId = 'Simulink:SimulationData:DatasetElementNotFound';
+        stWarn = warning('query', warnId);
+        prevState = stWarn.state;
+        warning('off', warnId);
+        cleanupWarn = onCleanup(@() warning(prevState, warnId));
+    catch
+    end
 
     % 必须信号: Battery_SOC
     % DEBUG: 列出 logsout 中可用信号名称，便于诊断命名不一致
@@ -190,15 +491,40 @@ function data = extract_from_logsout(logsout, data)
     try
         socNames = {'Battery_SOC','battery_soc','BatterySOC','SOC','soc'};
         soc = [];
+        socTS = [];
         for iN = 1:numel(socNames)
             try
-                soc = logsout.getElement(socNames{iN});
-                break;
+                nameLc = lower(socNames{iN});
+                if isa(logsout,'Simulink.SimulationData.Dataset')
+                    for ii = 1:logsout.numElements
+                        el = [];
+                        try, el = logsout.getElement(ii); catch, el = []; end
+                        if isempty(el), continue; end
+                        nm1 = '';
+                        try, nm1 = lower(string(el.Name)); catch, nm1 = ''; end
+                        if strcmp(nm1, nameLc)
+                            if isprop(el,'Values') && isa(el.Values,'timeseries')
+                                soc = el; socTS = el.Values; break;
+                            elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
+                                val = el.Values;
+                                for jj = 1:val.numElements
+                                    sub = [];
+                                    try, sub = val.getElement(jj); catch, sub = []; end
+                                    if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
+                                        soc = sub; socTS = sub.Values; break;
+                                    end
+                                end
+                                if ~isempty(socTS), break; end
+                            end
+                        end
+                    end
+                    if ~isempty(socTS), break; end
+                end
             catch
             end
         end
-        if isempty(soc)
-            % fallback: scan elements for name containing 'soc'
+        if isempty(socTS)
+            % fallback: scan elements for name containing 'soc' (Name or BlockPath)
             if isa(logsout,'Simulink.SimulationData.Dataset')
                 for ii = 1:logsout.numElements
                     el = [];
@@ -207,20 +533,48 @@ function data = extract_from_logsout(logsout, data)
                     catch
                         el = [];
                     end
-                    if ~isempty(el)
+                    if isempty(el), continue; end
+                    try
+                        nm1 = '';
                         try
-                            nm = lower(string(el.Name));
-                            if contains(nm,'soc')
-                                soc = el; break;
+                            nm1 = lower(string(el.Name));
+                        catch
+                        end
+                        nm2 = '';
+                        try
+                            bp = el.BlockPath;
+                            try
+                                nm2 = lower(char(bp));
+                            catch
+                                nm2 = '';
                             end
-                        catch, end
+                        catch
+                            nm2 = '';
+                        end
+                        if contains(nm1,'soc') || contains(nm2,'soc')
+                            % Try to extract timeseries directly or from nested Dataset
+                            if isprop(el,'Values') && isa(el.Values,'timeseries')
+                                soc = el; socTS = el.Values; break;
+                            elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
+                                val = el.Values;
+                                for jj = 1:val.numElements
+                                    sub = [];
+                                    try, sub = val.getElement(jj); catch, sub = []; end
+                                    if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
+                                        soc = sub; socTS = sub.Values; break;
+                                    end
+                                end
+                                if ~isempty(socTS), break; end
+                            end
+                        end
+                    catch
                     end
                 end
             end
         end
-        if ~isempty(soc) && isprop(soc,'Values') && isa(soc.Values,'timeseries')
-            data.Battery_SOC = timeseries(soc.Values.Data, soc.Values.Time);
-            fprintf('  ✓ 提取Battery_SOC: %d数据点\n', length(soc.Values.Data));
+        if ~isempty(socTS)
+            data.Battery_SOC = timeseries(socTS.Data, socTS.Time);
+            fprintf('  ✓ 提取Battery_SOC: %d数据点\n', length(socTS.Data));
         else
             error('Battery_SOC not found in logsout');
         end
@@ -233,14 +587,39 @@ function data = extract_from_logsout(logsout, data)
     try
         sohNames = {'Battery_SOH','battery_soh','BatterySOH','SOH','soh'};
         soh = [];
+        sohTS = [];
         for iN = 1:numel(sohNames)
             try
-                soh = logsout.getElement(sohNames{iN});
-                break;
+                nameLc = lower(sohNames{iN});
+                if isa(logsout,'Simulink.SimulationData.Dataset')
+                    for ii = 1:logsout.numElements
+                        el = [];
+                        try; el = logsout.getElement(ii); catch; el = []; end
+                        if isempty(el), continue; end
+                        nm1 = '';
+                        try; nm1 = lower(string(el.Name)); catch; nm1 = ''; end
+                        if strcmp(nm1, nameLc)
+                            if isprop(el,'Values') && isa(el.Values,'timeseries')
+                                soh = el; sohTS = el.Values; break;
+                            elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
+                                val = el.Values;
+                                for jj = 1:val.numElements
+                                    sub = [];
+                                    try; sub = val.getElement(jj); catch; sub = []; end
+                                    if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
+                                        soh = sub; sohTS = sub.Values; break;
+                                    end
+                                end
+                                if ~isempty(sohTS), break; end
+                            end
+                        end
+                    end
+                    if ~isempty(sohTS), break; end
+                end
             catch
             end
         end
-        if isempty(soh)
+        if isempty(sohTS)
             if isa(logsout,'Simulink.SimulationData.Dataset')
                 for ii = 1:logsout.numElements
                     el = [];
@@ -249,20 +628,47 @@ function data = extract_from_logsout(logsout, data)
                     catch
                         el = [];
                     end
-                    if ~isempty(el)
+                    if isempty(el), continue; end
+                    try
+                        nm1 = '';
                         try
-                            nm = lower(string(el.Name));
-                            if contains(nm,'soh')
-                                soh = el; break;
+                            nm1 = lower(string(el.Name));
+                        catch
+                        end
+                        nm2 = '';
+                        try
+                            bp = el.BlockPath;
+                            try
+                                nm2 = lower(char(bp));
+                            catch
+                                nm2 = '';
                             end
-                        catch, end
+                        catch
+                            nm2 = '';
+                        end
+                        if contains(nm1,'soh') || contains(nm2,'soh')
+                            if isprop(el,'Values') && isa(el.Values,'timeseries')
+                                soh = el; sohTS = el.Values; break;
+                            elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
+                                val = el.Values;
+                                for jj = 1:val.numElements
+                                    sub = [];
+                                    try, sub = val.getElement(jj); catch, sub = []; end
+                                    if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
+                                        soh = sub; sohTS = sub.Values; break;
+                                    end
+                                end
+                                if ~isempty(sohTS), break; end
+                            end
+                        end
+                    catch
                     end
                 end
             end
         end
-        if ~isempty(soh) && isprop(soh,'Values') && isa(soh.Values,'timeseries')
-            data.Battery_SOH = timeseries(soh.Values.Data, soh.Values.Time);
-            fprintf('  ✓ 提取Battery_SOH: %d数据点\n', length(soh.Values.Data));
+        if ~isempty(sohTS)
+            data.Battery_SOH = timeseries(sohTS.Data, sohTS.Time);
+            fprintf('  ✓ 提取Battery_SOH: %d数据点\n', length(sohTS.Data));
         else
             error('Battery_SOH not found in logsout');
         end
@@ -277,8 +683,36 @@ function data = extract_from_logsout(logsout, data)
         power = [];
         for iN = 1:numel(pwrNames)
             try
-                power = logsout.getElement(pwrNames{iN});
-                break;
+                nameLc = lower(pwrNames{iN});
+                if isa(logsout,'Simulink.SimulationData.Dataset')
+                    for ii = 1:logsout.numElements
+                        el = [];
+                        try; el = logsout.getElement(ii); catch; el = []; end
+                        if isempty(el), continue; end
+                        nm1 = '';
+                        try; nm1 = lower(string(el.Name)); catch; nm1 = ''; end
+                        if strcmp(nm1, nameLc)
+                            if isprop(el,'Values') && isa(el.Values,'timeseries')
+                                power = el; break;
+                            elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
+                                val = el.Values;
+                                for jj = 1:val.numElements
+                                    sub = [];
+                                    try; sub = val.getElement(jj); catch; sub = []; end
+                                    if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
+                                        power = sub; break;
+                                    end
+                                end
+                                if ~isempty(power) && isprop(power,'Values') && isa(power.Values,'timeseries')
+                                    break;
+                                end
+                            end
+                        end
+                    end
+                    if ~isempty(power) && isprop(power,'Values') && isa(power.Values,'timeseries')
+                        break;
+                    end
+                end
             catch
             end
         end
@@ -290,13 +724,47 @@ function data = extract_from_logsout(logsout, data)
                 catch
                     el = [];
                 end
-                if ~isempty(el)
+                if isempty(el), continue; end
+                try
+                    nm1 = '';
                     try
-                        nm = lower(string(el.Name));
-                        if (contains(nm,'batt') || contains(nm,'battery')) && contains(nm,'power')
-                            power = el; break;
+                        nm1 = lower(string(el.Name));
+                    catch
+                    end
+                    nm2 = '';
+                    try
+                        bp = el.BlockPath;
+                        try
+                            nm2 = lower(char(bp));
+                        catch
+                            nm2 = '';
                         end
-                    catch, end
+                    catch
+                        nm2 = '';
+                    end
+                    % 匹配电池功率：兼容 'power'/'p_batt'/'p...' + 'batt' 组合，优先 timeseries，Dataset 则向下展开
+                    isBatt1 = contains(nm1,'batt') || contains(nm1,'battery');
+                    isBatt2 = contains(nm2,'batt') || contains(nm2,'battery');
+                    hasPow1  = contains(nm1,'power') || contains(nm1,'p_batt') || startsWith(strtrim(nm1),'p');
+                    hasPow2  = contains(nm2,'power') || contains(nm2,'p_batt') || startsWith(strtrim(nm2),'p');
+                    if (isBatt1 || isBatt2) && (hasPow1 || hasPow2)
+                        if isprop(el,'Values') && isa(el.Values,'timeseries')
+                            power = el; break;
+                        elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
+                            val = el.Values;
+                            for jj = 1:val.numElements
+                                sub = [];
+                                try, sub = val.getElement(jj); catch, sub = []; end
+                                if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
+                                    power = sub; break;
+                                end
+                            end
+                            if ~isempty(power) && isprop(power,'Values') && isa(power.Values,'timeseries')
+                                break;
+                            end
+                        end
+                    end
+                catch
                 end
             end
         end
@@ -308,13 +776,38 @@ function data = extract_from_logsout(logsout, data)
         % Battery_Power可选,不报错
     end
 
-    % 可选信号: Grid_Cost (用于经济分析)
+    % 可选信号: Grid_Cost (用于经济分析) - 安全扫描，无警告
     try
-        cost = logsout.getElement('Grid_Cost');
-        cost_data = cost.Values.Data;
-        data.cumulative_cost = sum(cost_data);
-        data.average_hourly_cost = mean(cost_data);
-        fprintf('  ✓ 提取Grid_Cost: 累计成本 = %.2f\n', data.cumulative_cost);
+        costTS = [];
+        if isa(logsout,'Simulink.SimulationData.Dataset')
+            targetNames = {'grid_cost','gridcost','cost_grid'};
+            for ii = 1:logsout.numElements
+                el = [];
+                try; el = logsout.getElement(ii); catch; el = []; end
+                if isempty(el), continue; end
+                nm1 = '';
+                try; nm1 = lower(string(el.Name)); catch; nm1 = ''; end
+                if any(strcmp(nm1, targetNames))
+                    if isprop(el,'Values') && isa(el.Values,'timeseries')
+                        costTS = el.Values; break;
+                    elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
+                        val = el.Values;
+                        for jj = 1:val.numElements
+                            sub = []; try; sub = val.getElement(jj); catch; sub = []; end
+                            if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
+                                costTS = sub.Values; break;
+                            end
+                        end
+                        if ~isempty(costTS), break; end
+                    end
+                end
+            end
+        end
+        if ~isempty(costTS)
+            data.cumulative_cost = sum(costTS.Data, 'omitnan');
+            data.average_hourly_cost = mean(costTS.Data, 'omitnan');
+            fprintf('  ✓ 提取Grid_Cost: 累计成本 = %.2f\n', data.cumulative_cost);
+        end
     catch
         % Grid_Cost可选
     end
@@ -334,6 +827,22 @@ function data = extract_from_logsout(logsout, data)
             try
                 tc = logsout.getElement(altNames{iAlt});
                 data.TotalCost = timeseries(tc.Values.Data, tc.Values.Time);
+    % 兼容字段别名：为下游验证提供 P_batt 与 SOH_diff
+    if isfield(data,'Battery_Power') && ~isfield(data,'P_batt')
+        try
+            data.P_batt = data.Battery_Power;
+        catch
+            % ignore aliasing failure
+        end
+    end
+    if isfield(data,'SOH_Diff') && ~isfield(data,'SOH_diff')
+        try
+            data.SOH_diff = data.SOH_Diff;
+        catch
+            % ignore aliasing failure
+        end
+    end
+
                 fprintf('  ✓ 提取TotalCost(%s): %d数据点\n', altNames{iAlt}, length(tc.Values.Data));
                 break;
             catch
@@ -365,11 +874,36 @@ function data = extract_from_logsout(logsout, data)
     end
 
 
-    % 可选信号: Reward (用于分析)
+    % 可选信号: Reward (用于分析) - 支持 'Reward'/'reward'，安全扫描
     try
-        reward = logsout.getElement('Reward');
-        data.episode_reward = sum(reward.Values.Data);
-        fprintf('  ✓ 提取Reward: 总奖励 = %.2f\n', data.episode_reward);
+        rewardTS = [];
+        if isa(logsout,'Simulink.SimulationData.Dataset')
+            for ii = 1:logsout.numElements
+                el = [];
+                try; el = logsout.getElement(ii); catch; el = []; end
+                if isempty(el), continue; end
+                nm1 = '';
+                try; nm1 = lower(string(el.Name)); catch; nm1 = ''; end
+                if strcmp(nm1,'reward')
+                    if isprop(el,'Values') && isa(el.Values,'timeseries')
+                        rewardTS = el.Values; break;
+                    elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
+                        val = el.Values;
+                        for jj = 1:val.numElements
+                            sub = []; try; sub = val.getElement(jj); catch; sub = []; end
+                            if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
+                                rewardTS = sub.Values; break;
+                            end
+                        end
+                        if ~isempty(rewardTS), break; end
+                    end
+                end
+            end
+        end
+        if ~isempty(rewardTS)
+            data.episode_reward = sum(rewardTS.Data, 'omitnan');
+            fprintf('  ✓ 提取Reward: 总奖励 = %.2f\n', data.episode_reward);
+        end
     catch
         % Reward可选
     end
@@ -593,10 +1127,13 @@ function display_data_summary(data)
 
 
     if isfield(data, 'Battery_Power') && isa(data.Battery_Power, 'timeseries')
-        power = data.Battery_Power.Data / 1000;  % 转换为kW
+        powW = double(data.Battery_Power.Data);
         fprintf('  Battery_Power:\n');
-        fprintf('    - 数据点: %d\n', length(power));
-        fprintf('    - 范围: %.1f kW ~ %.1f kW\n', min(power), max(power));
+        fprintf('    - 数据点: %d\n', length(powW));
+        fprintf('    - 原始范围: %.1f ~ %.1f (原始单位)\n', min(powW), max(powW));
+        % 额外打印 kW 范围，便于人工判断单位
+        powkW = powW / 1000;
+        fprintf('    - 换算范围: %.2f kW ~ %.2f kW\n', min(powkW), max(powkW));
     end
 
     if isfield(data, 'cumulative_cost')
@@ -684,21 +1221,41 @@ function data = extract_from_simout_clean_v2(simOut)
 
     % 定位 logsout（兼容多种返回格式）
     logsout = [];
+    % 1) 优先使用 SimulationOutput 的 get 接口（支持对象动态属性）
     try
-        if isfield(simOut,'logsout')
-            logsout = simOut.logsout;
-        elseif isfield(simOut,'SimulationInfo')
-            try
-                logsout = simOut.SimulationInfo.SimulationOutput.logsout;
-            catch
-            end
-        elseif isfield(simOut,'simout')
-            try
-                logsout = simOut.simout.logsout;
-            catch
-            end
-        end
+        logsout = simOut.get('logsout');
     catch
+    end
+    % 2) 直接点取属性（若 get 不支持/未创建则可能抛异常）
+    if isempty(logsout)
+        try
+            logsout = simOut.logsout;
+        catch
+        end
+    end
+    % 3) 兼容 RL 仿真返回格式
+    if isempty(logsout)
+        try
+            logsout = simOut.SimulationInfo.SimulationOutput.logsout;
+        catch
+        end
+    end
+    % 4) 其他包装形式
+    if isempty(logsout)
+        try
+            logsout = simOut.simout.logsout;
+        catch
+        end
+    end
+    % 5) 最后尝试 get(simOut) 返回的结构体中探测
+    if isempty(logsout)
+        try
+            sAll = get(simOut);
+            if isstruct(sAll) && isfield(sAll,'logsout')
+                logsout = sAll.logsout;
+            end
+        catch
+        end
     end
 
     % 调试打印

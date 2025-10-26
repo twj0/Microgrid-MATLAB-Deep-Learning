@@ -1,4 +1,4 @@
-function env = create_env(simulation_days)
+﻿function env = create_env(simulation_days)
 %CREATE_ENV 构建并返回 rlSimulinkEnv 以用于重放或诊断
 %   用途：为 test_data_extraction.m 或其他脚本提供标准 env 构建入口。
 %   - 模型: model/Microgrid.slx

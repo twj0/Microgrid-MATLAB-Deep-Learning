@@ -1,4 +1,4 @@
-function P_out = P_manager(P_in, P_in_delay, SOC, SOC_delay, SOC_dot)
+﻿function P_out = P_manager(P_in, P_in_delay, SOC, SOC_delay, SOC_dot)
     %P_manager: 生成输出信号
     %输入：P_in，范围在[-1e4,1e4]
     %输入信号；P_in_delay，延迟后的输入信号

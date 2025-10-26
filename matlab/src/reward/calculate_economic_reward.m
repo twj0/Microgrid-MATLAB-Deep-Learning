@@ -1,99 +1,71 @@
-function total_reward = calculate_economic_reward(P_net_load_W, P_batt_W, price_norm, SOC)
-% CALCULATE_ECONOMIC_REWARD - A reward function for economic optimization.
+function reward = calculate_economic_reward(P_net_load_W, P_batt_W, price, time_of_day)
+%CALCULATE_ECONOMIC_REWARD 简化版经济奖励函数（仅购电场景 P_{grid}>0）
+%   reward = calculate_economic_reward(P_net_load_W, P_batt_W, price, time_of_day)
 %
-% This function calculates a reward for the RL agent based on economic criteria.
-% It considers grid interaction, electricity prices, and battery health.
+%   设计（方案A：成本型 + 峰时宽容，平滑可微）：
+%   - 仅考虑从电网购电（P_grid>0），忽略卖电；
+%   - 低电价时“多买电”给正奖励，高电价时“少买电”给负奖励；
+%   - 使用 softplus/tanh 实现渐进式、平滑饱和；
+%   - 在人性化高峰时段（8~10, 18~22）对负向惩罚适度减弱（宽容因子）；
+%   - 数值尺度：正向约≤+80，负向约≥-200；
+%   - 输出限幅，防止极值扰动训练。
 %
-% Inputs:
-%   P_net_load_W  - Net load the BESS must handle (P_load - P_pv) [W].
-%                   >0 means net consumption; <0 means surplus PV.
-%   P_batt_W      - Battery power command [W]. >0 for charging, <0 for discharging.
-%   price_norm    - Normalized electricity price. Either 0 (low) or 1 (high).
-%   SOC           - Battery state of charge [%].
+%   输入:
+%     P_net_load_W  净负荷功率(W)
+%     P_batt_W      电池功率(W)（>0充电，<0放电）
+%     price         当前电价($/kWh)
+%     time_of_day   当前小时[0,24]
 %
-% Output:
-%   total_reward  - A scalar reward signal for the RL agent.
+%   说明:
+%     本函数不含SOC门控；严格SOC约束在 Battery_Health_Penalty 或上层组合中实现。
 
-% --- 1. Tunable Parameters (Weights and Thresholds) ---
-% These values control the agent's priorities.
+% 基本防御
+if ~isfinite(P_net_load_W), P_net_load_W = 0; end
+if ~isfinite(P_batt_W),     P_batt_W     = 0; end
+if ~isfinite(price),        price        = 0.45; end
+if ~isfinite(time_of_day),  time_of_day  = 12; end
 
-% -- Weights --
-W_PEAK_SHAVING   = 2.0;   % Reward for reducing demand during high-price periods.
-W_VALLEY_FILLING = 1.5;   % Reward for charging at low prices.
-W_GRID_SELLING   = 1.0;   % Reward for selling energy back to the grid.
-W_SOC_COMFORT    = 0.5;   % Encourage staying in a healthy SOC range.
-W_DEGRADATION    = 0.3;   % Penalty for aggressive charge/discharge actions.
+% 电网功率（仅购电有效）
+P_grid_W  = P_net_load_W + P_batt_W;
+P_grid_kW = max(P_grid_W, 0) / 1000.0;
 
-% -- Thresholds --
-PEAK_LOAD_THRESHOLD_W = 4000;  % [W] Net load threshold for peak shaving.
-HIGH_PRICE_VALUE      = 1;     % Value indicating high price.
-LOW_PRICE_VALUE       = 0;     % Value indicating low price.
-
-% -- SOC Parameters --
-SOC_TARGET      = 50.0;  % [%] The ideal center point for SOC.
-SOC_STD_DEV     = 20.0;  % [%] Width of the comfort zone.
-SOC_UPPER_LIMIT = 100;   % [%] Upper limit for SOC.
-SOC_LOWER_LIMIT = 0;     % [%] Lower limit for SOC.
-BATT_RATED_POWER_W = 10000; % [W] For normalizing the degradation penalty.
-
-% --- 2. Calculate Grid Power ---
-P_grid_W = P_net_load_W + P_batt_W;
-
-% --- 3. Calculate Individual Reward Components ---
-
-% Initialize all reward components to zero.
-peak_shaving_reward = 0;
-valley_filling_reward = 0;
-grid_selling_reward = 0;
-
-% (A) HIGH-VALUE REWARD: Peak Shaving
-% Reward for discharging during high-price periods to reduce grid consumption.
-if P_net_load_W > PEAK_LOAD_THRESHOLD_W && P_batt_W < 0 && price_norm == HIGH_PRICE_VALUE
-    % The higher the discharge power, the greater the reward (but still negative)
-    peak_shaving_reward = W_PEAK_SHAVING * (-P_batt_W / 1000);
-end
-
-% (B) OPPORTUNITY REWARD: Valley Filling (Arbitrage)
-% Reward for charging at low prices to store energy.
-if price_norm == LOW_PRICE_VALUE && P_batt_W > 0
-    valley_filling_reward = W_VALLEY_FILLING * (P_batt_W / 1000);
-end
-
-% (C) GRID SELLING REWARD
-% Reward for selling energy back to the grid (when P_grid < 0).
-if P_grid_W < -100  % Small tolerance to avoid rewarding noise
-    grid_selling_reward = W_GRID_SELLING * (-P_grid_W / 1000);
-end
-
-% (D) HEALTH REWARD: SOC Comfort Zone
-% A Gaussian reward that is maximum at SOC_TARGET and smoothly decreases
-% as SOC moves away. This encourages the agent to keep the battery ready.
-if SOC >= SOC_LOWER_LIMIT && SOC <= SOC_UPPER_LIMIT
-    soc_deviation = SOC - SOC_TARGET;
-    soc_comfort_reward = W_SOC_COMFORT * exp(- (soc_deviation^2) / (2 * SOC_STD_DEV^2));
+% 价格归一（基于参考阈值）
+PRICE_VALLEY = 0.391;
+PRICE_PEAK   = 0.514;
+if PRICE_PEAK <= PRICE_VALLEY
+    z = 0.5; % 保底
 else
-    % Strong penalty for violating SOC limits
-    soc_comfort_reward = -50;
+    z = (price - PRICE_VALLEY) / (PRICE_PEAK - PRICE_VALLEY); % 0(谷)~1(峰)
+    z = max(0.0, min(1.0, z));
 end
 
-% (E) HEALTH PENALTY: Battery Degradation
-% A small quadratic penalty on battery power to discourage extreme charge/discharge
-% rates, promoting longer battery life.
-degradation_penalty = -W_DEGRADATION * (abs(P_batt_W) / BATT_RATED_POWER_W)^2;
+% 功率归一与平滑购电量
+P_REF_KW = 20.0;           % 参考功率（可按项目重标定）
+p        = P_grid_kW / P_REF_KW;   % 无量纲
+sp_k     = 3.0;                     % softplus斜率
+softplus = @(x) log1p(exp(-abs(x))) + max(x, 0); % 数值稳定softplus
+q        = softplus(sp_k * p) / sp_k;            % 平滑购电量
 
-% --- 4. Summation and Final Safety Check ---
+% 正向鼓励（低价多买）与负向惩罚（高价少买），均用tanh软饱和
+A_POS   = 80.0;   % 正向上限标定
+B_NEG   = 180.0;  % 负向上限标定（惩罚更强）
+beta_q  = 5.0;    % 正向增长速率
+gamma_q = 7.0;    % 负向增长速率（更陡）
 
-% Combine all components into the final reward signal.
-total_reward = peak_shaving_reward + ...
-               valley_filling_reward + ...
-               grid_selling_reward + ...
-               soc_comfort_reward + ...
-               degradation_penalty;
+reward_pos = A_POS * (1.0 - z) * tanh(beta_q  * q);
+reward_neg = -B_NEG * z       * tanh(gamma_q * q);
 
-% HARD SAFETY CONSTRAINT: Override all rewards with a large penalty if SOC
-% goes outside operational limits.
-if SOC < SOC_LOWER_LIMIT || SOC > SOC_UPPER_LIMIT
-    total_reward = -100;
+% 人性化高峰时段宽容：仅减弱负向惩罚部分
+is_human_peak = ((time_of_day >= 8  && time_of_day <= 10) || ...
+                 (time_of_day >= 18 && time_of_day <= 22));
+PEAK_RELIEF   = 0.30;  % 在人性化高峰时段减弱30%的惩罚
+if is_human_peak
+    reward_neg = (1.0 - PEAK_RELIEF) * reward_neg;
 end
 
+reward_raw = reward_pos + reward_neg;
+
+% 限幅（防御NaN/Inf）
+if ~isfinite(reward_raw), reward_raw = 0.0; end
+reward = max(-200.0, min(80.0, reward_raw));
 end

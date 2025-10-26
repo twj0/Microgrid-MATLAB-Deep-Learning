@@ -19,6 +19,43 @@ function penalty = Battery_Health_Penalty(P_batt_norm, SOC, dSOC_dt, dSOH_dt)
 %     • Output is bounded to [-320, 32] to keep values numerically stable.
 
 %% ------------------------------------------------------------------------
+% 0. Strict SOC-only mode (nargin==1)
+%% ------------------------------------------------------------------------
+if nargin == 1
+    % In this mode, the single input is SOC (percentage, [0,100] nominal)
+    SOC_only = P_batt_norm;
+    if ~isfinite(SOC_only)
+        penalty = 0.0; return;
+    end
+
+    % In-band platform + bell-shaped reward; out-of-band softplus barrier
+    R_IN   = 58.0;     % in-band high reward (<= +60)
+    SIGMA  = 20.0;     % bell width around 50%
+    DELTA  = 2.5;      % band-edge smoothing width
+    ALPHA  = 0.9;      % softplus slope for barrier
+    P_EXP  = 2.0;      % barrier exponent (1.5~2.5)
+    K_OUT  = 4.2;      % out-of-band penalty gain
+
+    % Band gate g_band in (0,1): product of two logistics
+    g_low   = 1.0 ./ (1.0 + exp(-(SOC_only - 20.0) / DELTA));
+    g_high  = 1.0 ./ (1.0 + exp(-(80.0 - SOC_only) / DELTA));
+    g_band  = g_low .* g_high;
+
+    % In-band reward (platform + Gaussian around 50%)
+    r_center = exp(-((SOC_only - 50.0) / SIGMA) ^ 2);
+    r_in     = R_IN * (0.4 + 0.6 * r_center) .* g_band;
+
+    % Out-of-band softplus barrier (fast growth, smooth at edges)
+    softplus = @(x) log1p(exp(-abs(x))) + max(x, 0);
+    penalty_out = -K_OUT * ( softplus(ALPHA * (SOC_only - 80.0)) ^ P_EXP ...
+                           + softplus(ALPHA * (20.0 - SOC_only)) ^ P_EXP );
+
+    raw = r_in + penalty_out;
+    penalty = clamp_reward(raw, 320.0, 60.0);  % final clamp to [-320, +60]
+    return;
+end
+
+%% ------------------------------------------------------------------------
 % 1. Input validation and normalisation
 %% ------------------------------------------------------------------------
 

@@ -83,15 +83,28 @@ try
         [agent, results] = train_with_online_best_saving(agent, env, train_opts, maxEpisodes, maxSteps);
         train_time = results.training_time; % 由辅助函数内部统计
     else
+        % Plan A: Cosine annealing via nested ResetFcn (single-train)
+        baseReset = env.ResetFcn; if isempty(baseReset), baseReset = @(in) in; end
+        lr_trace = [];
+        cfgLR = struct('mode','cosine','Tmax',maxEpisodes, ...
+                       'baseA',NaN,'minA',NaN, ...
+                       'baseC',3e-5,'minC',3e-6);
+        env.ResetFcn = @reset_with_lr;
         stats = train(agent, env, train_opts);
         train_time = toc(t_start);
         training_summary = summarize_training(stats, train_time, maxEpisodes);
         results = training_summary;
+        try
+            results.lr_trace = lr_trace;
+        catch
+        end
     end
     results.reviewer_schedule = reviewerSchedule;
     results.reward_monitor = compute_reward_monitor(results.episode_rewards, reviewerSchedule);
     [results.best_total_reward, results.best_total_episode] = derive_best_total_reward(results.reward_monitor);
     plot_reward_monitor(results.reward_monitor);
+
+
     assignin('base', 'dqn_reward_monitor', results.reward_monitor);
     fprintf('\n✓ DQN训练完成\n');
     fprintf('  - 总回合: %d\n', results.total_episodes);
@@ -118,6 +131,30 @@ catch ME
     fprintf('⚠ 最优结果保存失败: %s\n', ME.message);
     fprintf('  训练结果仍然有效,可继续使用\n');
 end
+
+% --- Nested ResetFcn for LR cosine annealing (Plan A) ---
+function in = reset_with_lr(in)
+    % Maintain global episode counter for Simulink/RL blocks
+    ep = 1;
+    try
+        ep = evalin('base','g_episode_num') + 1;
+    catch
+        ep = 1;
+    end
+    assignin('base','g_episode_num', ep);
+
+    % Compute and apply learning rates
+    lr = compute_lr(ep, cfgLR);
+    actorLR = lr.actor; criticLR = lr.critic;
+    agent = drl_set_lr(agent, actorLR, criticLR);
+
+    % Record learning rate trace: [episode, actorLR, criticLR]
+    lr_trace(end+1, :) = [double(ep) double(actorLR) double(criticLR)]; %#ok<AGROW>
+
+    % Call original ResetFcn
+    in = baseReset(in);
+end
+
 end
 
 function ensure_run_manager_on_path()
@@ -140,6 +177,8 @@ for i = 1:max_depth
     if exist(fullfile(project_root, 'matlab'), 'dir') && exist(fullfile(project_root, 'model'), 'dir')
         return;
     end
+
+
     parent_dir = fileparts(project_root);
     if isempty(parent_dir) || strcmp(parent_dir, project_root)
         break;
@@ -630,4 +669,32 @@ function name = get_algorithm_name_from_path(algorithm_dir)
 if isempty(name)
     name = 'algorithm';
 end
+end
+
+
+function agent = drl_set_lr(agent, actorLR, criticLR)
+% Update only Critic LR for DQN; ignore actorLR if NaN
+try
+    if isfinite(criticLR)
+        C = getCritic(agent);
+        if ~isempty(C)
+            if numel(C) > 1
+                for k = 1:numel(C), C(k).Options.LearnRate = criticLR; end
+            else
+                C.Options.LearnRate = criticLR;
+            end
+            agent = setCritic(agent, C);
+        end
+    end
+catch
+end
+end
+
+function lr = compute_lr(ep, cfg)
+% Cosine annealing from base -> min across [1..Tmax]
+Tmax = max(1, cfg.Tmax);
+t = min((ep-1)/max(1, Tmax-1), 1);
+s = 0.5*(1 + cos(pi*t));
+lr.actor  = cfg.minA + (cfg.baseA - cfg.minA) * s;  % may be NaN for DQN
+lr.critic = cfg.minC + (cfg.baseC - cfg.minC) * s;
 end

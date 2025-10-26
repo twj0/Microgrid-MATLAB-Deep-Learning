@@ -21,17 +21,14 @@ PGRID_TOL_DISCHARGE = 8000;
 PGRID_TOL_IDLE = 6000;
 SMOOTH_REF = 6000;           % smoothing threshold (used with deltaP)
 NET_BAL_TOL = 8000;          % slightly looser net balance
-SWITCH_EP = 450;
-RAMP_WINDOW = 100;
-ALPHA = 3000;                % base scaling (will be staged)
-RAMP_UP_END = 800;           % 前500-1000个episode更平滑的权重提升（此处取800）
-STABLE_START = 1600;         % 1600之后进入收敛稳定期（最后400个episode保持不变）
-ALPHA_MAX = 9000;            % 目标权重上限（目标值）
 
 % 新增：SOC高斯奖励参数与评论家缩放因子
-SOC_GAUSS_TARGET = 50;  % 目标SOC(%)
-SOC_GAUSS_SIGMA  = 15;  % 高斯σ
-CRITIC_SCALE     = 0.3; % 评论家输出整体缩放到原来的30%（如需更小量级可调至0.1）
+SOC_GAUSS_TARGET    = 50;  % 目标SOC(%)
+SOC_GAUSS_SIGMA     = 15;  % 高斯σ
+CRITIC_SCALE        = 1.0; % 评论家输出基准缩放
+CRITIC_RATIO_START  = 0.25; % gate 开启初期相对于基线的倍数
+CRITIC_RATIO_TARGET = 1.50; % gate 全开后目标倍数
+CRITIC_UNIT_REF     = 0.60; % 预期 critic_unit 平均值用于归一化
 
 % 课程式容差放宽与奖励裁剪参数（使早期更易学，逐步收敛）
 TOL_EASE_END = 800;           % 前800个episode逐步从宽容到严格
@@ -80,7 +77,7 @@ r_batt = triangular_score(P_batt_W, target_batt, tol_pos, tol_neg);
 
 if valley
     target_grid = PGRID_TARGET_VALLEY;
-    grid_tol_pos = PGRID_TOL_CHARGE * tol_scale;    % 
+    grid_tol_pos = PGRID_TOL_CHARGE * tol_scale;    % 电网容差（谷时充电）
     grid_tol_neg = PGRID_TOL_DISCHARGE * tol_scale;
 elseif peak
     target_grid = PGRID_TARGET_PEAK;
@@ -115,32 +112,80 @@ end
 % 新增：SOC高斯奖励项
 soc_gauss = exp(-((soc - SOC_GAUSS_TARGET)^2) / (2 * SOC_GAUSS_SIGMA^2));
 
-% 重新分配权重：原六项整体×0.8，预留0.2给SOC高斯
-critic_unit = ...
-    0.224 * r_soc     + ...
-    0.200 * r_batt    + ...
-    0.144 * r_grid    + ...
-    0.096 * r_balance + ...
-    0.080 * r_smooth  + ...
-    0.056 * r_time_sync + ...
-    0.200 * soc_gauss;
-critic_unit = saturate_unit(critic_unit);
+% 评分栈：加入方案A（时段-SOC匹配）与方案B（SOC目标轨迹）联合塑形
+P_grid_kW = max(P_grid_eval, 0) / 1000.0;
+P_REF_KW = 20.0;
+q = min(P_grid_kW / P_REF_KW, 3.0);
+% 价格归一（0=谷，1=峰）
+z = (price - PRICE_VALLEY) / (PRICE_PEAK - PRICE_VALLEY);
+if ~isfinite(z), z = 0.5; end
+z = max(0.0, min(1.0, z));
+% SOC门控（[20,80]内接近1，外快速衰减）
+delta_soc = 3.0;
+g_soc = 1.0 ./ (1.0 + exp(-(soc - 20.0) / delta_soc)) .* ...
+        1.0 ./ (1.0 + exp(-(80.0 - soc) / delta_soc));
+% 成本门控：电价×购电程度越高，越不利（越小越接近1）
+g_cost = 1.0 ./ (1.0 + exp(((z .* tanh(5.0 * q)) - 0.35) / 0.10));
 
-gate = (episode_num - SWITCH_EP) / RAMP_WINDOW;
-gate = saturate_unit(gate);
+% 方案A：时段-SOC匹配度（谷低→充，峰高→放）
+z0 = 0.35; z1 = 0.65; dz = 0.10; SOC_low_thr = 40; SOC_high_thr = 60; delta_thr = 3.0;
+s_valley = 1.0 ./ (1.0 + exp((z - z0) / dz));      % 越接近谷越接近1
+s_peak   = 1.0 ./ (1.0 + exp((z1 - z) / dz));      % 越接近峰越接近1
+m_valley = s_valley .* 1.0 ./ (1.0 + exp((soc - SOC_low_thr) / delta_thr));   % 低SOC在谷时更优
+m_peak   = s_peak   .* 1.0 ./ (1.0 + exp((SOC_high_thr - soc) / delta_thr)); % 高SOC在峰时更优
+m = 0.5 * m_valley + 0.5 * m_peak;
 
-% 评论家权重调度：
-% - 前800个episode线性提升：从初始ALPHA平滑增长到ALPHA_MAX（让前500-1000个episode更渐进）
-% - 800<episode<1600：保持权重不变（稳定阶段）
-% - episode>=1600：固定不变，展示收敛走势
-ep = max(episode_num, 1);
-if ep <= RAMP_UP_END
-    ramp_ratio = ep / RAMP_UP_END; % [0,1]
-    alpha_eff = ALPHA + (ALPHA_MAX - ALPHA) * ramp_ratio;
-elseif ep < STABLE_START
-    alpha_eff = ALPHA_MAX;
+% 方案B：SOC目标轨迹（TOU参考曲线）
+SOCv = 65; SOCf = 50; SOCp = 35; sigma = 10;
+w_val  = 1.0 ./ (1.0 + exp((z - z0) / dz));
+w_peak = 1.0 ./ (1.0 + exp((z1 - z) / dz));
+w_flat = max(0.0, 1.0 - w_val - w_peak);
+wnorm  = max(1e-6, (w_val + w_flat + w_peak));
+SOC_ref = (w_val.*SOCv + w_flat.*SOCf + w_peak.*SOCp) ./ wnorm;
+r_track = exp(-((soc - SOC_ref).^2) ./ (2.0 * sigma^2));
+
+% 组合评分栈（权重按确认方案），新增项乘以gate渐进启用
+w_batt = 0.12;
+w_grid = 0.12;
+w_balance = 0.12;
+w_soc = 0.14;
+w_cost = 0.14;
+w_soc_gauss = 0.10;
+w_smooth = 0.08;
+w_sync = 0.06;
+w_match = 0.06;
+w_track = 0.06;
+% 使用局部门控 gate_local 只渐进启用新增项（总体评论家仍有全局 gate）
+edge0 = 500; edge1 = 1000;
+if edge1 <= edge0
+    gate_local = double(episode_num >= edge1);
 else
-    alpha_eff = ALPHA_MAX;
+    t_local = max(0.0, min(1.0, (episode_num - edge0) / (edge1 - edge0)));
+    gate_local = t_local .* t_local .* (3.0 - 2.0 * t_local);
+end
+
+stacked_score = ...
+    w_batt * r_batt + ...
+    w_grid * r_grid + ...
+    w_balance * r_balance + ...
+    w_soc * g_soc + ...
+    w_cost * g_cost + ...
+    w_soc_gauss * soc_gauss + ...
+    w_smooth * r_smooth + ...
+    w_sync * r_time_sync + ...
+    w_match * (gate_local .* m) + ...
+    w_track * (gate_local .* r_track);
+
+s = stacked_score;
+critic_unit = saturate_unit(s);
+
+% Episode9718454696362655500	658769000 541 5675952)
+edge0 = 500; edge1 = 1000;
+if edge1 <= edge0
+    gate = double(episode_num >= edge1);
+else
+    t = max(0.0, min(1.0, (episode_num - edge0) / (edge1 - edge0)));
+    gate = t .* t .* (3.0 - 2.0 * t);
 end
 
 % 防御性：对NaN/Inf输入做降级处理，避免奖励传播出错
@@ -148,13 +193,22 @@ if ~isfinite(econ_reward), econ_reward = 0; end
 if ~isfinite(health_penalty), health_penalty = 0; end
 pos_econ = max(econ_reward, 0);
 pos_health = max(health_penalty, 0);
+
+baseline_reward = pos_econ + pos_health;
+if baseline_reward < 1e-6
+    baseline_reward = 1e-6;
+end
+
+critic_ratio = CRITIC_RATIO_START + (CRITIC_RATIO_TARGET - CRITIC_RATIO_START) * gate;
+alpha_eff = baseline_reward * critic_ratio / max(CRITIC_UNIT_REF, 1e-3);
+
 critic_reward = CRITIC_SCALE * gate * alpha_eff * critic_unit;
 
 % 组合原始奖励并进行软/硬裁剪，抑制极端值（避免EpisodeQ0暴发到极大负数/正数）
 raw_total = pos_econ + pos_health + critic_reward;
-soft_total = REWARD_SOFTCLIP * tanh(raw_total / REWARD_SOFTCLIP);  % tanh
+soft_total = REWARD_SOFTCLIP * tanh(raw_total / REWARD_SOFTCLIP);  % tanh 压缩（软裁剪）
 % 硬裁剪保护
- total_reward = max(min(soft_total, REWARD_HARDCLIP), -REWARD_HARDCLIP);
+total_reward = max(min(soft_total, REWARD_HARDCLIP), -REWARD_HARDCLIP);
 
 % 返回前有效性检查：若出现NaN/Inf，给出警告并返回大负值以稳定训练
 if ~isfinite(total_reward)

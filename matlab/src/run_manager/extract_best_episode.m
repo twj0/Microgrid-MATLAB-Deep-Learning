@@ -1,4 +1,4 @@
-function episodeData = extract_best_episode(simOut, agent, env, maxSteps)
+﻿function episodeData = extract_best_episode(simOut, agent, env, maxSteps)
 %EXTRACT_BEST_EPISODE 从仿真结果或重新运行提取最优episode数据
 %   只保存必要的时序数据(SOC/SOH/Power)，减小文件体积
 %
@@ -15,7 +15,7 @@ function episodeData = extract_best_episode(simOut, agent, env, maxSteps)
         maxSteps = 720;
     end
 
-    episodeData = struct();
+    episodeData = struct(); %#ok<NASGU> % 初始化默认输出，兼容无输入时的回退路径
 
     % 情况1: 提供了simOut,直接提取数据
     if nargin >= 1 && ~isempty(simOut)
@@ -414,7 +414,7 @@ function data = extract_from_simout(simOut)
     end
 
     % 屏蔽受损的 DEBUG 代码块（无影响提取逻辑）
-    if false
+    if local_debug_enabled()
 
     % DEBUG: 
     try
@@ -494,22 +494,34 @@ function data = extract_from_logsout(logsout, data)
         socTS = [];
         for iN = 1:numel(socNames)
             try
-                nameLc = lower(socNames{iN});
+                nameKey = socNames{iN};
                 if isa(logsout,'Simulink.SimulationData.Dataset')
                     for ii = 1:logsout.numElements
                         el = [];
-                        try, el = logsout.getElement(ii); catch, el = []; end
+                        try
+    el = logsout.getElement(ii);
+catch
+    el = [];
+end
                         if isempty(el), continue; end
                         nm1 = '';
-                        try, nm1 = lower(string(el.Name)); catch, nm1 = ''; end
-                        if strcmp(nm1, nameLc)
+                        try
+    nm1 = string(el.Name);
+catch
+    nm1 = '';
+end
+                        if strcmpi(nm1, nameKey)
                             if isprop(el,'Values') && isa(el.Values,'timeseries')
                                 soc = el; socTS = el.Values; break;
                             elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
                                 val = el.Values;
                                 for jj = 1:val.numElements
                                     sub = [];
-                                    try, sub = val.getElement(jj); catch, sub = []; end
+                                    try
+    sub = val.getElement(jj);
+catch
+    sub = [];
+end
                                     if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
                                         soc = sub; socTS = sub.Values; break;
                                     end
@@ -559,7 +571,11 @@ function data = extract_from_logsout(logsout, data)
                                 val = el.Values;
                                 for jj = 1:val.numElements
                                     sub = [];
-                                    try, sub = val.getElement(jj); catch, sub = []; end
+                                    try
+    sub = val.getElement(jj);
+catch
+    sub = [];
+end
                                     if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
                                         soc = sub; socTS = sub.Values; break;
                                     end
@@ -590,22 +606,34 @@ function data = extract_from_logsout(logsout, data)
         sohTS = [];
         for iN = 1:numel(sohNames)
             try
-                nameLc = lower(sohNames{iN});
+                nameKey = sohNames{iN};
                 if isa(logsout,'Simulink.SimulationData.Dataset')
                     for ii = 1:logsout.numElements
                         el = [];
-                        try; el = logsout.getElement(ii); catch; el = []; end
+                        try
+    el = logsout.getElement(ii);
+catch
+    el = [];
+end
                         if isempty(el), continue; end
                         nm1 = '';
-                        try; nm1 = lower(string(el.Name)); catch; nm1 = ''; end
-                        if strcmp(nm1, nameLc)
+                        try
+    nm1 = string(el.Name);
+catch
+    nm1 = '';
+end
+                        if strcmpi(nm1, nameKey)
                             if isprop(el,'Values') && isa(el.Values,'timeseries')
                                 soh = el; sohTS = el.Values; break;
                             elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
                                 val = el.Values;
                                 for jj = 1:val.numElements
                                     sub = [];
-                                    try; sub = val.getElement(jj); catch; sub = []; end
+                                    try
+    sub = val.getElement(jj);
+catch
+    sub = [];
+end
                                     if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
                                         soh = sub; sohTS = sub.Values; break;
                                     end
@@ -653,7 +681,11 @@ function data = extract_from_logsout(logsout, data)
                                 val = el.Values;
                                 for jj = 1:val.numElements
                                     sub = [];
-                                    try, sub = val.getElement(jj); catch, sub = []; end
+                                    try
+    sub = val.getElement(jj);
+catch
+    sub = [];
+end
                                     if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
                                         soh = sub; sohTS = sub.Values; break;
                                     end
@@ -683,22 +715,34 @@ function data = extract_from_logsout(logsout, data)
         power = [];
         for iN = 1:numel(pwrNames)
             try
-                nameLc = lower(pwrNames{iN});
+                nameKey = pwrNames{iN};
                 if isa(logsout,'Simulink.SimulationData.Dataset')
                     for ii = 1:logsout.numElements
                         el = [];
-                        try; el = logsout.getElement(ii); catch; el = []; end
+                        try
+    el = logsout.getElement(ii);
+catch
+    el = [];
+end
                         if isempty(el), continue; end
                         nm1 = '';
-                        try; nm1 = lower(string(el.Name)); catch; nm1 = ''; end
-                        if strcmp(nm1, nameLc)
+                        try
+    nm1 = string(el.Name);
+catch
+    nm1 = '';
+end
+                        if strcmpi(nm1, nameKey)
                             if isprop(el,'Values') && isa(el.Values,'timeseries')
                                 power = el; break;
                             elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
                                 val = el.Values;
                                 for jj = 1:val.numElements
                                     sub = [];
-                                    try; sub = val.getElement(jj); catch; sub = []; end
+                                    try
+    sub = val.getElement(jj);
+catch
+    sub = [];
+end
                                     if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
                                         power = sub; break;
                                     end
@@ -754,7 +798,11 @@ function data = extract_from_logsout(logsout, data)
                             val = el.Values;
                             for jj = 1:val.numElements
                                 sub = [];
-                                try, sub = val.getElement(jj); catch, sub = []; end
+                                try
+    sub = val.getElement(jj);
+catch
+    sub = [];
+end
                                 if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
                                     power = sub; break;
                                 end
@@ -783,17 +831,30 @@ function data = extract_from_logsout(logsout, data)
             targetNames = {'grid_cost','gridcost','cost_grid'};
             for ii = 1:logsout.numElements
                 el = [];
-                try; el = logsout.getElement(ii); catch; el = []; end
+                try
+    el = logsout.getElement(ii);
+catch
+    el = [];
+end
                 if isempty(el), continue; end
                 nm1 = '';
-                try; nm1 = lower(string(el.Name)); catch; nm1 = ''; end
-                if any(strcmp(nm1, targetNames))
+                try
+    nm1 = string(el.Name);
+catch
+    nm1 = '';
+end
+                if any(strcmpi(nm1, targetNames))
                     if isprop(el,'Values') && isa(el.Values,'timeseries')
                         costTS = el.Values; break;
                     elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
                         val = el.Values;
                         for jj = 1:val.numElements
-                            sub = []; try; sub = val.getElement(jj); catch; sub = []; end
+                            sub = [];
+try
+    sub = val.getElement(jj);
+catch
+    sub = [];
+end
                             if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
                                 costTS = sub.Values; break;
                             end
@@ -880,17 +941,30 @@ function data = extract_from_logsout(logsout, data)
         if isa(logsout,'Simulink.SimulationData.Dataset')
             for ii = 1:logsout.numElements
                 el = [];
-                try; el = logsout.getElement(ii); catch; el = []; end
+                try
+    el = logsout.getElement(ii);
+catch
+    el = [];
+end
                 if isempty(el), continue; end
                 nm1 = '';
-                try; nm1 = lower(string(el.Name)); catch; nm1 = ''; end
-                if strcmp(nm1,'reward')
+                try
+    nm1 = string(el.Name);
+catch
+    nm1 = '';
+end
+                if strcmpi(nm1,'reward')
                     if isprop(el,'Values') && isa(el.Values,'timeseries')
                         rewardTS = el.Values; break;
                     elseif isprop(el,'Values') && isa(el.Values,'Simulink.SimulationData.Dataset')
                         val = el.Values;
                         for jj = 1:val.numElements
-                            sub = []; try; sub = val.getElement(jj); catch; sub = []; end
+                            sub = [];
+try
+    sub = val.getElement(jj);
+catch
+    sub = [];
+end
                             if ~isempty(sub) && isprop(sub,'Values') && isa(sub.Values,'timeseries')
                                 rewardTS = sub.Values; break;
                             end
@@ -906,6 +980,25 @@ function data = extract_from_logsout(logsout, data)
         end
     catch
         % Reward可选
+    end
+end
+
+function tf = local_debug_enabled()
+    v = '';
+    try
+        v = getenv('EXTRACT_EPISODE_DEBUG');
+    catch
+        v = '';
+    end
+    if isempty(v)
+        tf = false;
+        return;
+    end
+    x = str2double(v);
+    if isnan(x)
+        tf = false;
+    else
+        tf = (x ~= 0);
     end
 end
 

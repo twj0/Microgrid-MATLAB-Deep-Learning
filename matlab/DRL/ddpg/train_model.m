@@ -75,9 +75,20 @@ try
         [agent, results] = train_with_online_best_saving(agent, env, train_opts, maxEpisodes, maxSteps);
         train_time = results.training_time;
     else
+        % Plan A: Cosine annealing via nested ResetFcn (single-train)
+        baseReset = env.ResetFcn; if isempty(baseReset), baseReset = @(in) in; end
+        lr_trace = [];
+        cfgLR = struct('mode','cosine','Tmax',maxEpisodes, ...
+                       'baseA',5e-4,'minA',5e-5, ...
+                       'baseC',1e-3,'minC',1e-4);
+        env.ResetFcn = @reset_with_lr;
         stats = train(agent, env, train_opts);
         train_time = toc(t_start);
         results = summarize_training(stats, train_time, maxEpisodes);
+        try
+            results.lr_trace = lr_trace;
+        catch
+        end
     end
     fprintf('\n✓ DDPG training finished\n');
     fprintf('  - Episodes: %d\n', results.total_episodes);
@@ -99,6 +110,29 @@ try
 catch ME
     fprintf('⚠ Best episode save failed: %s\n', ME.message);
 end
+    % --- Nested ResetFcn for LR cosine annealing (Plan A) ---
+    function in = reset_with_lr(in)
+        % Maintain global episode counter for Simulink/RL blocks
+        ep = 1;
+        try
+            ep = evalin('base','g_episode_num') + 1;
+        catch
+            ep = 1;
+        end
+        assignin('base','g_episode_num', ep);
+
+        % Compute and apply learning rates
+        lr = compute_lr(ep, cfgLR);
+        actorLR = lr.actor; criticLR = lr.critic;
+        agent = drl_set_lr(agent, actorLR, criticLR);
+
+        % Record learning rate trace: [episode, actorLR, criticLR]
+        lr_trace(end+1, :) = [double(ep) double(actorLR) double(criticLR)]; %#ok<AGROW>
+
+        % Call original ResetFcn
+        in = baseReset(in);
+    end
+
 end
 
 function agent = create_ddpg_agent(obs_info, act_info, env, options)
@@ -794,4 +828,46 @@ if isempty(valid)
 else
     avg = mean(valid);
 end
+end
+
+
+function agent = drl_set_lr(agent, actorLR, criticLR)
+% Safely update Actor/Critic learn rates; skip parts with NaN
+try
+    if isfinite(actorLR)
+        a = getActor(agent);
+        if ~isempty(a)
+            if numel(a) > 1
+                for i = 1:numel(a), a(i).Options.LearnRate = actorLR; end
+            else
+                a.Options.LearnRate = actorLR;
+            end
+            agent = setActor(agent, a);
+        end
+    end
+catch
+end
+try
+    if isfinite(criticLR)
+        C = getCritic(agent);
+        if ~isempty(C)
+            if numel(C) > 1
+                for k = 1:numel(C), C(k).Options.LearnRate = criticLR; end
+            else
+                C.Options.LearnRate = criticLR;
+            end
+            agent = setCritic(agent, C);
+        end
+    end
+catch
+end
+end
+
+function lr = compute_lr(ep, cfg)
+% Cosine annealing from base -> min across [1..Tmax]
+Tmax = max(1, cfg.Tmax);
+t = min((ep-1)/max(1, Tmax-1), 1);
+s = 0.5*(1 + cos(pi*t));
+lr.actor  = cfg.minA + (cfg.baseA - cfg.minA) * s;
+lr.critic = cfg.minC + (cfg.baseC - cfg.minC) * s;
 end

@@ -43,9 +43,9 @@ function visualization(options)
         mkdir(opts.outputDir);
     end
 
-    fprintf('\n=== SAC 可视化分析 ===\n');
-    fprintf('  • 输出目录: %s\n', opts.outputDir);
-    fprintf('  • 时间戳  : %s\n', opts.timestamp);
+    fprintf('\n=== SAC Visualization ===\n');
+    fprintf('  Output dir: %s\n', opts.outputDir);
+    fprintf('  Timestamp : %s\n', opts.timestamp);
 
     trainingResults = get_option(options, 'trainingResults', []);
     trainingStats   = get_option(options, 'trainingStats', []);
@@ -105,30 +105,30 @@ function visualization(options)
         pvData, loadData, priceData);
 
     % Create additional scientific visualization components for research publication
-    fprintf('\n=== 科研级可视化分析 ===\n');
+    fprintf('\n=== Research-grade visualizations ===\n');
 
     % 4. Power flow analysis visualization
     try
         figures{end+1} = create_power_flow_analysis(opts, pvData, loadData, priceData);
-        fprintf('  ✓ 功率流分析可视化完成\n');
+        fprintf('  Power flow analysis completed\n');
     catch ME
-        fprintf('  ⚠ 功率流分析失败: %s\n', ME.message);
+        fprintf('  Power flow analysis failed: %s\n', ME.message);
     end
 
     % 5. Economic analysis visualization
     try
         figures{end+1} = create_economic_analysis(opts, pvData, loadData, priceData);
-        fprintf('  ✓ 经济分析可视化完成\n');
+        fprintf('  Economic analysis completed\n');
     catch ME
-        fprintf('  ⚠ 经济分析失败: %s\n', ME.message);
+        fprintf('  Economic analysis failed: %s\n', ME.message);
     end
 
     % 6. System performance visualization
     try
         figures{end+1} = create_system_performance(opts, pvData, loadData, priceData);
-        fprintf('  ✓ 系统性能可视化完成\n');
+        fprintf('  System performance analysis completed\n');
     catch ME
-        fprintf('  ⚠ 系统性能分析失败: %s\n', ME.message);
+        fprintf('  System performance analysis failed: %s\n', ME.message);
     end
 
     % 7. Battery performance visualization (SOC/SOH)
@@ -138,29 +138,50 @@ function visualization(options)
         batteryPower = fetch_workspace_variable(opts.workspace, ["Battery_Power", "battery_power", "batteryPower"]);
         batterySOHDiff = fetch_workspace_variable(opts.workspace, ["SOH_Diff", "battery_soh_diff", "soh_diff", "SOH_Diff"]);
         hasBatteryData = ~isempty(batterySOC) || ~isempty(batterySOH) || ~isempty(batterySOHDiff);
+        % Fallback: try loading from results/best_run/best_episode_data.mat when workspace lacks battery data
+        if ~hasBatteryData
+            try
+                thisFile = mfilename('fullpath');
+                projRoot = fileparts(fileparts(fileparts(thisFile))); % .../matlab/src -> 项目根目录
+                dataMat = fullfile(projRoot, 'results', 'best_run', 'best_episode_data.mat');
+                if isfile(dataMat)
+                    S = load(dataMat);
+                    if isempty(batterySOC) && isfield(S, 'Battery_SOC'), batterySOC = S.Battery_SOC; end
+                    if isempty(batterySOH) && isfield(S, 'Battery_SOH'), batterySOH = S.Battery_SOH; end
+                    if isempty(batteryPower) && isfield(S, 'Battery_Power'), batteryPower = S.Battery_Power; end
+                    if isempty(batterySOHDiff) && isfield(S, 'SOH_Diff'), batterySOHDiff = S.SOH_Diff; end
+                    hasBatteryData = ~isempty(batterySOC) || ~isempty(batterySOH) || ~isempty(batterySOHDiff);
+                end
+            catch
+            end
+        end
         if hasBatteryData
-            figures{end+1} = create_battery_performance(opts, batterySOC, batterySOH, batteryPower);
-            figures{end+1} = create_battery_summary(opts, batterySOC, batterySOH, batterySOHDiff);
-            fprintf('  ✓ 电池性能可视化完成\n');
+            figBP = create_battery_performance(opts, batterySOC, batterySOH, batteryPower, batterySOHDiff);
+            try, if isgraphics(figBP), figBP.UserData = struct('label','battery_performance'); end, catch, end
+            figures{end+1} = figBP;
+            figBS = create_battery_summary(opts, batterySOC, batterySOH, batterySOHDiff);
+            try, if isgraphics(figBS), figBS.UserData = struct('label','battery_summary'); end, catch, end
+            figures{end+1} = figBS;
+            fprintf('  Battery performance visualization completed\n');
         else
-            fprintf('  ⊘ 未检测到电池数据(Battery_SOC/Battery_SOH),跳过电池可视化\n');
+            fprintf('  No battery data (Battery_SOC/Battery_SOH) detected, skipping battery visualization\n');
         end
     catch ME
-        fprintf('  ⚠ 电池性能分析失败: %s\n', ME.message);
+        fprintf('  Battery performance analysis failed: %s\n', ME.message);
     end
-    % === P1.5 论文核心图 (Fig A–D) ===
+    % === P1.5 论文核心图 (Fi   g A–D) ===
     try
         % 统一到每小时timetable
         tt = preprocess_timeseries(pvProfile, loadProfile, priceProfile);
 
-        % 尝试注入 Battery_Power 与 Battery_SOC
+        % 尝试注入 Battery_Power �? Battery_SOC
         batteryPowerVar = fetch_workspace_variable(opts.workspace, ["Battery_Power", "battery_power", "batteryPower"]);
         batterySOCVar   = fetch_workspace_variable(opts.workspace, ["Battery_SOC", "battery_soc", "soc", "SOC"]);
-        % 若工作区未找到，尝试从 results/best_run/best_episode_data.mat 读取
+        % 若工作区�?找到，尝试从 results/best_run/best_episode_data.mat 读取
         if (isempty(batteryPowerVar) || isempty(batterySOCVar))
             try
                 thisFile = mfilename('fullpath');
-                projRoot = fileparts(fileparts(thisFile)); % .../matlab/src -> 项目根目录
+                projRoot = fileparts(fileparts(fileparts(thisFile))); % .../matlab/src -> ��Ŀ��Ŀ¼
                 dataMat = fullfile(projRoot, 'results', 'best_run', 'best_episode_data.mat');
                 if isfile(dataMat)
                     S = load(dataMat);
@@ -172,7 +193,7 @@ function visualization(options)
                     end
                 end
             catch
-                % 忽略读取失败，后续按缺省处理
+                % 忽略读取失败，后�?按缺省�?�理
             end
         end
 
@@ -196,7 +217,7 @@ function visualization(options)
             tt.Battery_SOC = fillmissing(tt.Battery_SOC, 'linear', 'EndValues','nearest');
         end
 
-        % 计算并网购电功率(Grid_Power)
+        % 计算并网�?电功�?(Grid_Power)
         tt.Grid_Power = compute_grid_power(tt.PV_Power, tt.Load_Power, tt.Battery_Power);
 
         priceSellProfile = fetch_workspace_variable(opts.workspace, ["price_sell_profile","price_sell","Price_Sell"]);
@@ -213,24 +234,31 @@ function visualization(options)
         figB = plot_fig_B_battery(opts, tt);      if isgraphics(figB), figB.UserData = struct('label','figB_battery');   figures{end+1} = figB; end
         figC = plot_fig_C_grid_exchange(opts, tt);if isgraphics(figC), figC.UserData = struct('label','figC_grid');      figures{end+1} = figC; end
         figD = plot_fig_D_supply_stack(opts, tt); if isgraphics(figD), figD.UserData = struct('label','figD_supply');    figures{end+1} = figD; end
-        fprintf('  ✓ Fig A–D 论文图型生成完成\n');
+        fprintf('  Paper figures Fig A-D generation completed\n');
     catch ME
-        fprintf('  ⚠ 论文图型(Fig A–D)生成失败: %s\n', ME.message);
+        fprintf('  Paper figures (Fig A-D) generation failed: %s\n', ME.message);
     end
 
 
+    try
+        export_single_variable_figures(opts, tt, batterySOCVar, batterySOH, batteryPowerVar, batterySOHDiff);
+        fprintf('  Single-variable figures export completed\n');
+    catch ME
+        fprintf('  Single-variable figures export failed: %s\n', ME.message);
+    end
+
     savedCount = save_figures(figures, opts);
-    fprintf('  ✓ 图像生成完成 (共%d个)\n\n', savedCount);
+    fprintf('  Figure generation completed (total %d)\n\n', savedCount);
 end
 
 function fig = create_training_overview(opts, rewards, episodes, avgReward, episodeSteps, q0Series, trainingResults)
-    % 根据调用方的filePrefix自适应标题，避免误标算法名称
-    fig = make_figure(sprintf('%s训练总览', char(get_option(opts, 'filePrefix', 'SAC'))), opts.showFigures, [100, 100, 1400, 800]);
+    % Adapt labels based on caller's filePrefix to avoid hard-coded algorithm names
+    fig = make_figure(sprintf('%s Training Summary', char(get_option(opts, 'filePrefix', 'SAC'))), opts.showFigures, [100, 100, 1400, 800]);
     tiledlayout(fig, 2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
 
     nexttile;
     if isempty(rewards)
-        text(0.5, 0.5, '无训练奖励数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'No training reward data', 'HorizontalAlignment', 'center', 'FontSize', 12);
     else
         plot(episodes, rewards, 'Color', [0.3, 0.5, 0.9], 'LineWidth', 1.3);
         hold on;
@@ -245,29 +273,29 @@ function fig = create_training_overview(opts, rewards, episodes, avgReward, epis
         hold off;
         xlabel('Episode');
         ylabel('Reward');
-        title('Episode Reward 轨迹');
+        title('Episode Reward Trajectory');
         grid on;
     end
 
     nexttile;
     if isempty(episodeSteps)
-        text(0.5, 0.5, '无Episode步数数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'No episode step data', 'HorizontalAlignment', 'center', 'FontSize', 12);
     else
         bar(episodes, episodeSteps, 'FaceColor', [0.2, 0.6, 0.6], 'EdgeColor', 'none');
         xlabel('Episode');
         ylabel('Steps');
-        title('每回合仿真步数');
+        title('Steps per episode');
         grid on;
     end
 
     nexttile;
     if isempty(rewards)
-        text(0.5, 0.5, '无奖励分布数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'No reward distribution data', 'HorizontalAlignment', 'center', 'FontSize', 12);
     else
         histogram(rewards, 'FaceColor', [0.4, 0.4, 0.8], 'EdgeColor', 'none', 'FaceAlpha', 0.8);
         xlabel('Reward');
         ylabel('Frequency');
-        title('奖励分布');
+        title('Reward Distribution');
         grid on;
     end
 
@@ -276,23 +304,23 @@ function fig = create_training_overview(opts, rewards, episodes, avgReward, epis
         plot(episodes, q0Series, 'm-', 'LineWidth', 1.4);
         xlabel('Episode');
         ylabel('Q0 Value');
-        title('Q0收敛趋势');
+        title('Q0 Convergence Trend');
         grid on;
     elseif ~isempty(avgReward)
         plot(episodes(1:numel(avgReward)), avgReward, 'g-', 'LineWidth', 1.6);
         xlabel('Episode');
         ylabel('Average Reward');
-        title('平均奖励走势');
+        title('Average Reward Trend');
         grid on;
     elseif ~isempty(rewards)
         cumAvg = cumsum(rewards) ./ (1:numel(rewards))';
         plot(episodes, cumAvg, 'g-', 'LineWidth', 1.6);
         xlabel('Episode');
         ylabel('Cumulative Avg');
-        title('奖励累计平均');
+        title('Cumulative Reward Average');
         grid on;
     else
-        text(0.5, 0.5, '无可用数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'No data available', 'HorizontalAlignment', 'center', 'FontSize', 12);
     end
 
     add_training_annotation(fig, rewards, trainingResults);
@@ -302,10 +330,10 @@ function fig = create_reward_monitor(opts, rewardMonitor, targetEpisodes)
     if nargin < 3 || isempty(targetEpisodes)
         targetEpisodes = 2000;
     end
-    fig = make_figure('DQN奖励监控', opts.showFigures, [120, 120, 1400, 600]);
+    fig = make_figure('DQN reward monitor', opts.showFigures, [120, 120, 1400, 600]);
     if isempty(rewardMonitor)
         axis off;
-        text(0.5, 0.5, '未找到奖励监控数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'Reward monitor data not found', 'HorizontalAlignment', 'center', 'FontSize', 12);
         return;
     end
 
@@ -358,14 +386,14 @@ function fig = create_reward_monitor(opts, rewardMonitor, targetEpisodes)
 
     hold on;
     plot_series(episodes, matlabReward, [0.30 0.75 0.93], 1.2, 'MATLAB奖励');
-    plot_series(episodes, modelReward, [0.00 0.45 0.74], 1.5, '模型奖励');
-    plot_series(episodes, totalReward, [0.85 0.33 0.10], 1.8, '总奖励');
-    plot_series(episodes, averageReward, [0.47 0.67 0.19], 2.0, '平均总奖励');
+    plot_series(episodes, modelReward, [0.00 0.45 0.74], 1.5, 'Model reward');
+    plot_series(episodes, totalReward, [0.85 0.33 0.10], 1.8, '总�?�励');
+    plot_series(episodes, averageReward, [0.47 0.67 0.19], 2.0, '平均总�?�励');
     hold off;
 
     xlabel('Episode');
-    ylabel('绘画奖励');
-    title(sprintf('奖励监控（前%d个Episode）', targetEpisodes));
+    ylabel('Reward');
+    title(sprintf('Reward monitor (first %d episodes)', targetEpisodes));
     legend('Location', 'best');
     grid on;
     xlim([1, max(targetEpisodes, max(episodes))]);
@@ -419,12 +447,12 @@ function fig = create_reward_monitor(opts, rewardMonitor, targetEpisodes)
 end
 
 function fig = create_microgrid_profiles(opts, pvData, loadData, priceData, strategy)
-    fig = make_figure('微电网运行概览', opts.showFigures, [150, 150, 1400, 900]);
+    fig = make_figure('Microgrid Operation Profiles', opts.showFigures, [150, 150, 1400, 900]);
     tiledlayout(fig, 3, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
 
     nexttile;
     if isempty(pvData.power) || isempty(loadData.power)
-        text(0.5, 0.5, '缺少光伏/负载曲线数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'Missing PV/load series', 'HorizontalAlignment', 'center', 'FontSize', 12);
     else
         [pvTime, pvPower] = align_and_clip_series(pvData.timeHours, pvData.power, 72);
         [loadTime, loadPower] = align_and_clip_series(loadData.timeHours, loadData.power, 72);
@@ -435,42 +463,42 @@ function fig = create_microgrid_profiles(opts, pvData, loadData, priceData, stra
         plot(loadTime, loadPower/1000, 'Color', [0.2, 0.3, 0.8], 'LineWidth', 1.5);
         plot(loadTime, netLoad/1000, '--', 'Color', [0.4, 0.7, 0.4], 'LineWidth', 1.2);
         hold off;
-        ylabel('功率 (kW)');
-        xlabel('时间 (小时)');
-        title('前72小时光伏/负载功率');
+        ylabel('Power (kW)');
+        xlabel('Time (hours)');
+        title('First 72 hours of PV/Load Power');
         legend({'PV Output', 'Load', 'Net Load'}, 'Location', 'best');
         grid on;
     end
 
     nexttile;
     if isempty(priceData.price)
-        text(0.5, 0.5, '缺少电价数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'Missing price data', 'HorizontalAlignment', 'center', 'FontSize', 12);
     else
         [priceTime, priceSeries] = align_and_clip_series(priceData.timeHours, priceData.price, 72);
         plot(priceTime, priceSeries, 'Color', [0.85, 0.33, 0.1], 'LineWidth', 1.5);
-        xlabel('时间 (小时)');
-        ylabel('电价 ($/kWh)');
-        title('电价曲线 (前72小时)');
+        xlabel('Time (hours)');
+        ylabel('Price ($/kWh)');
+        title('Price curve (first 72 hours)');
         grid on;
     end
 
     nexttile;
     if isempty(strategy.timeHours) || isempty(strategy.bestActionKW)
-        text(0.5, 0.5, '策略建议数据不可用', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'Strategy construction data unavailable', 'HorizontalAlignment', 'center', 'FontSize', 12);
     else
         plot(strategy.timeHours, strategy.bestActionKW, 'LineWidth', 1.5, 'Color', [0.2, 0.6, 0.6]);
         hold on;
         yline(0, 'k--', 'LineWidth', 1.0);
         hold off;
-        xlabel('时间 (小时)');
-        ylabel('电池功率 (kW)');
-        title('基于经济奖励的策略建议 (正充负放)');
+        xlabel('Time (hours)');
+        ylabel('Battery power (kW)');
+        title('Strategy suggestion based on economic reward (charge+/discharge-)');
         grid on;
     end
 end
 
 function fig = create_strategy_summary(opts, rewards, trainingResults, strategyMeta, pvData, loadData, priceData)
-    fig = make_figure('训练与策略总结', opts.showFigures, [180, 180, 1100, 840]);
+    fig = make_figure('Training and strategy summary', opts.showFigures, [180, 180, 1100, 840]);
     axis off;
 
     summaryLines = compose_summary_text(rewards, trainingResults, strategyMeta, pvData, loadData, priceData);
@@ -495,21 +523,21 @@ function add_training_annotation(figHandle, rewards, trainingResults)
 
     trainingTime = collect_field(trainingResults, 'training_time');
     if isempty(trainingTime)
-        formattedTime = '未知';
+        formattedTime = 'unknown';
     else
-        formattedTime = sprintf('%.1f 分钟', trainingTime / 60);
+        formattedTime = sprintf('%.1f minutes', trainingTime / 60);
     end
 
     improvement = finalAvg - initialAvg;
     annotation(figHandle, 'textbox', [0.55, 0.52, 0.4, 0.4], ...
         'String', { ...
-            sprintf('总回合数       : %d', totalEpisodes), ...
-            sprintf('初始10回合均值 : %.2f', initialAvg), ...
-            sprintf('末尾10回合均值 : %.2f', finalAvg), ...
-            sprintf('累计提升       : %.2f', improvement), ...
-            sprintf('最佳奖励       : %.2f', bestReward), ...
-            sprintf('最差奖励       : %.2f', worstReward), ...
-            sprintf('训练用时       : %s', formattedTime) ...
+            sprintf('Total episodes    : %d', totalEpisodes), ...
+            sprintf('First-10 mean     : %.2f', initialAvg), ...
+            sprintf('Last-10 mean      : %.2f', finalAvg), ...
+            sprintf('Improvement       : %.2f', improvement), ...
+            sprintf('Best reward       : %.2f', bestReward), ...
+            sprintf('Worst reward      : %.2f', worstReward), ...
+            sprintf('Training time     : %s', formattedTime) ...
         }, ...
         'FontSize', 10, ...
         'BackgroundColor', [1, 1, 1, 0.85], ...
@@ -980,9 +1008,9 @@ function summaryLines = compose_summary_text(rewards, trainingResults, strategyM
         sprintf('Estimated battery size  : %.0f kWh', strategyMeta.capacity_kWh)
         ''
         'Strategy tips:'
-        '  • Low price + low net load  -> charge the battery'
-        '  • High price + high net load -> discharge to support load'
-        '  • Negative net load         -> consider charging or idling'
+        '  * Low price + low net load  -> charge the battery'
+        '  * High price + high net load -> discharge to support load'
+        '  * Negative net load         -> consider charging or idling'
         ''
         sprintf('Figure generated at     : %s', char(datetime('now','Format','yyyy-MM-dd HH:mm:ss')))
         '════════════════════════════════════════════════════════'
@@ -1146,7 +1174,7 @@ function savedCount = save_figures(figures, opts)
         end
         savedCount = savedCount + 1;
 
-        % 优先使用图对象的自定义标签，其次退回到预设labels，最后用通用命名
+        % 优先使用图�?�象的自定义标�?�，其�?�退回到预�?�labels，最后用通用命名
         labelName = '';
         if idx <= numel(labels)
             labelName = labels{idx};
@@ -1167,9 +1195,9 @@ function savedCount = save_figures(figures, opts)
             filepath = fullfile(opts.outputDir, filename);
             try
                 viz_export(fig, filepath);
-                fprintf('    - 已保存: %s\n', filepath);
+                fprintf('    - Saved: %s\n', filepath);
             catch ME
-                fprintf('    ⚠ 保存失败 (%s): %s\n', labelName, ME.message);
+                fprintf('    * Save failed (%s): %s\n', labelName, ME.message);
             end
         end
         if opts.closeAfterSave
@@ -1418,7 +1446,8 @@ function fig = make_figure(name, showFigure, position)
         position = [100, 100, 1200, 800];
     end
     visibility = ternary(showFigure, 'on', 'off');
-    fig = figure('Name', name, 'Color', 'w', 'Visible', visibility, 'Position', position);
+    fig = figure('Name', name, 'Color', 'w', 'Visible', visibility, 'Position', position, ...
+                 'Renderer','painters', 'InvertHardcopy','off');
 end
 
 function value = get_option(options, field, defaultValue)
@@ -1449,16 +1478,20 @@ if ~exist(p, 'dir')
     mkdir(p);
 end
 try
+    % Ensure all graphics objects are rendered before exporting (important for offscreen figures)
+    drawnow;
     switch lower(ext)
         case {'.png','.jpg','.jpeg','.tif','.tiff'}
             if exist('exportgraphics','file') == 2
                 exportgraphics(fig, filepath, 'Resolution', 300, 'BackgroundColor', 'white');
             else
                 set(fig, 'PaperPositionMode', 'auto');
+                drawnow;
                 print(fig, filepath, '-dpng', '-r300');
             end
         otherwise
             if exist('exportgraphics','file') == 2
+                drawnow;
                 exportgraphics(fig, filepath, 'ContentType', 'vector', 'BackgroundColor', 'white');
             else
                 error('viz_export:saveFailed', 'exportgraphics not available for vector output');
@@ -1622,7 +1655,7 @@ end
 %% BATTERY PERFORMANCE VISUALIZATION
 %% ========================================================================
 
-function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryPower)
+function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryPower, batterySOHDiff)
     %CREATE_BATTERY_PERFORMANCE Generate battery SOC/SOH performance visualization
     %   Creates a comprehensive 6-subplot figure showing battery state of charge,
     %   state of health, charging/discharging power, and statistical analysis
@@ -1634,13 +1667,16 @@ function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryP
     %       batterySOH - Battery state of health time series or array
     %       batteryPower - Battery power time series or array (optional)
 
-    fig = make_figure('电池性能分析', opts.showFigures, [400, 400, 1400, 900]);
+    fig = make_figure('Battery Performance Analysis', opts.showFigures, [400, 400, 1400, 900]);
     tiledlayout(fig, 2, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
 
     % Extract and process time series data
-    [socTime, socData] = extract_battery_series(batterySOC, '时间 (天)');
-    [sohTime, sohData] = extract_battery_series(batterySOH, '时间 (天)');
-    [powerTime, powerData] = extract_battery_series(batteryPower, '时间 (天)');
+    horizonDays = 30;
+
+    [socTime, socData] = extract_battery_series(batterySOC, 'Time (h)');
+    [sohTime, sohData] = extract_battery_series(batterySOH, 'Time (h)');
+    [diffTime, diffData] = extract_battery_series(batterySOHDiff, 'Time (h)');
+    [powerTime, powerData] = extract_battery_series(batteryPower, 'Time (h)');
 
     % Convert time from hours to days if necessary
     socTime = ensure_time_in_days(socTime);
@@ -1668,7 +1704,7 @@ function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryP
     % Subplot 1: SOC 30-day time series
     nexttile;
     if isempty(socData)
-        text(0.5, 0.5, '无SOC数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'No SOC data', 'HorizontalAlignment', 'center', 'FontSize', 12);
         axis off;
     else
         plot(socTime, socData, 'b-', 'LineWidth', 2);
@@ -1676,9 +1712,9 @@ function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryP
         yline(90, 'r--', 'LineWidth', 1, 'Alpha', 0.5, 'DisplayName', 'Max SOC');
         yline(10, 'r--', 'LineWidth', 1, 'Alpha', 0.5, 'DisplayName', 'Min SOC');
         hold off;
-        xlabel('时间 (天)');
+        xlabel('Time (days)');
         ylabel('SOC (%)');
-        title('电池SOC - 30天时序');
+        title('Battery SOC - 30 days');
         legend('SOC', 'Location', 'best');
         grid on;
         xlim([0, min(max(socTime), horizonDays)]);
@@ -1688,13 +1724,13 @@ function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryP
     % Subplot 2: SOH 30-day time series
     nexttile;
     if isempty(sohData)
-        text(0.5, 0.5, '无SOH数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'No SOH data', 'HorizontalAlignment', 'center', 'FontSize', 12);
         axis off;
     else
         plot(sohTime, sohData, 'g-', 'LineWidth', 2);
-        xlabel('时间 (天)');
+        xlabel('Time (days)');
         ylabel('SOH (%)');
-        title('电池SOH - 30天时序');
+        title('Battery SOH - 30 days');
         grid on;
         xlim([0, min(max(sohTime), horizonDays)]);
         ylim([max(80, min(sohData)-5), 100]);
@@ -1704,20 +1740,20 @@ function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryP
     nexttile;
     if isempty(powerData)
         % If no power data available, simulate or show placeholder
-        text(0.5, 0.5, '无电池功率数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'No battery power data', 'HorizontalAlignment', 'center', 'FontSize', 12);
         axis off;
     else
         positive_power = max(0, powerData);
         negative_power = min(0, powerData);
-
-        area(powerTime, positive_power, 'FaceColor', 'red', 'FaceAlpha', 0.7, 'DisplayName', '放电');
+        
+        area(powerTime, positive_power, 'FaceColor', 'red', 'FaceAlpha', 0.7, 'DisplayName', 'Discharge');
         hold on;
-        area(powerTime, negative_power, 'FaceColor', 'blue', 'FaceAlpha', 0.7, 'DisplayName', '充电');
+        area(powerTime, negative_power, 'FaceColor', 'blue', 'FaceAlpha', 0.7, 'DisplayName', 'Charge');
         yline(0, 'k--', 'LineWidth', 0.5);
         hold off;
-        xlabel('时间 (天)');
-        ylabel('电池功率 (kW)');
-        title('电池充放电功率');
+        xlabel('Time (days)');
+        ylabel('Battery power (kW)');
+        title('Battery charge/discharge power');
         legend('Location', 'best');
         grid on;
         xlim([0, min(max(powerTime), horizonDays)]);
@@ -1726,13 +1762,13 @@ function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryP
     % Subplot 4: SOC distribution histogram
     nexttile;
     if isempty(socData)
-        text(0.5, 0.5, '无SOC分布数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'No SOC distribution data', 'HorizontalAlignment', 'center', 'FontSize', 12);
         axis off;
     else
         histogram(socData, 20, 'FaceColor', [0.3, 0.5, 0.7], 'FaceAlpha', 0.8, 'EdgeColor', 'none');
         xlabel('SOC (%)');
-        ylabel('频次');
-        title('SOC分布直方图');
+        ylabel('Frequency');
+        title('SOC histogram');
         grid on;
         xlim([0, 100]);
     end
@@ -1740,15 +1776,15 @@ function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryP
     % Subplot 5: Battery efficiency analysis
     nexttile;
     if isempty(socData) || isempty(powerData)
-        text(0.5, 0.5, '无效率分析数据', 'HorizontalAlignment', 'center', 'FontSize', 12);
+        text(0.5, 0.5, 'No efficiency data', 'HorizontalAlignment', 'center', 'FontSize', 12);
         axis off;
     else
         % Calculate round-trip efficiency based on SOC and power
         efficiency = calculate_battery_efficiency(powerData, socData);
         plot(powerTime, efficiency * 100, 'm-', 'LineWidth', 1.5);
-        xlabel('时间 (天)');
-        ylabel('效率 (%)');
-        title('电池往返效率');
+        xlabel('Time (days)');
+        ylabel('Efficiency (%)');
+        title('Battery round-trip efficiency');
         grid on;
         xlim([0, min(max(powerTime), horizonDays)]);
         ylim([80, 100]);
@@ -1758,19 +1794,19 @@ function fig = create_battery_performance(opts, batterySOC, batterySOH, batteryP
     nexttile;
     create_battery_statistics_panel_v2(socData, sohData, powerData);
 
-    sgtitle('电池性能分析 - 30天仿真', 'FontSize', 14, 'FontWeight', 'bold');
+    sgtitle('Battery performance - 30-day simulation', 'FontSize', 14, 'FontWeight', 'bold');
 end
 
 function fig = create_battery_summary(opts, batterySOC, batterySOH, batterySOHDiff)
     %CREATE_BATTERY_SUMMARY Produce compact SOC/SOH/SOH diff visualisation with 3 subplots
-    fig = make_figure('电池状态概要', opts.showFigures, [420, 420, 1200, 720]);
+    fig = make_figure('Battery status summary', opts.showFigures, [420, 420, 1200, 720]);
     tiledlayout(fig, 3, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
 
     horizonDays = 30;
 
-    [socTime, socData] = extract_battery_series(batterySOC, '时间 (天)');
-    [sohTime, sohData] = extract_battery_series(batterySOH, '时间 (天)');
-    [diffTime, diffData] = extract_battery_series(batterySOHDiff, '时间 (天)');
+    [socTime, socData] = extract_battery_series(batterySOC, '时间 (�?)');
+    [sohTime, sohData] = extract_battery_series(batterySOH, '时间 (�?)');
+    [diffTime, diffData] = extract_battery_series(batterySOHDiff, '时间 (�?)');
 
     socTime = ensure_time_in_days(socTime);
     sohTime = ensure_time_in_days(sohTime);
@@ -1787,15 +1823,15 @@ function fig = create_battery_summary(opts, batterySOC, batterySOH, batterySOHDi
     % Subplot 1: SOC trend
     nexttile;
     if isempty(socData)
-        axis_off_with_message('SOC 数据缺失');
+        axis_off_with_message('SOC data missing');
     else
         plot(socTime, socData, 'LineWidth', 1.8, 'Color', [0.16, 0.44, 0.84]);
         hold on;
         yline([10, 90], 'r--', 'LineWidth', 1, 'Alpha', 0.4);
         hold off;
-        xlabel('时间 (天)');
+        xlabel('Time (days)');
         ylabel('SOC (%)');
-        title('SOC 趋势');
+        title('SOC trend');
         grid on;
         ylim([max(0, min(socData, [], 'omitnan')-5), min(100, max(socData, [], 'omitnan')+5)]);
     end
@@ -1803,12 +1839,12 @@ function fig = create_battery_summary(opts, batterySOC, batterySOH, batterySOHDi
     % Subplot 2: SOH trend
     nexttile;
     if isempty(sohData)
-        axis_off_with_message('SOH 数据缺失');
+        axis_off_with_message('SOH data missing');
     else
         plot(sohTime, sohData, 'LineWidth', 1.8, 'Color', [0.13, 0.64, 0.33]);
-        xlabel('时间 (天)');
+        xlabel('Time (days)');
         ylabel('SOH (%)');
-        title('SOH 趋势');
+        title('SOH trend');
         grid on;
         ylim([max(70, min(sohData, [], 'omitnan')-2), 100]);
     end
@@ -1816,16 +1852,16 @@ function fig = create_battery_summary(opts, batterySOC, batterySOH, batterySOHDi
     % Subplot 3: SOH differential
     nexttile;
     if isempty(diffData)
-        axis_off_with_message('SOH变化 数据缺失');
+        axis_off_with_message('SOH delta data missing');
     else
         stem(diffTime, diffData, 'filled', 'MarkerSize', 3, 'Color', [0.85, 0.33, 0.1]);
-        xlabel('时间 (天)');
+        xlabel('Time (days)');
         ylabel('ΔSOH (%)');
-        title('SOH 差分');
+        title('SOH differential');
         grid on;
     end
 
-    sgtitle('电池SOC/SOH状态概要', 'FontSize', 14, 'FontWeight', 'bold');
+    sgtitle('Battery SOC/SOH summary', 'FontSize', 14, 'FontWeight', 'bold');
 end
 
 function [timeVec, dataVec] = extract_battery_series(input, ~)
@@ -2036,7 +2072,7 @@ function create_battery_statistics_panel_v2(socData, sohData, batteryPower)
 
 
     if isempty(socData) && isempty(sohData)
-        text(0.5, 0.5, '无电池统计数据', 'HorizontalAlignment', 'center', ...
+        text(0.5, 0.5, 'No battery statistics data', 'HorizontalAlignment', 'center', ...
              'FontSize', 12, 'Units', 'normalized');
         return;
     end
@@ -2069,15 +2105,15 @@ function create_battery_statistics_panel_v2(socData, sohData, batteryPower)
     end
 
     % Build text string
-    text_str = sprintf(['电池统计数据:\n\n' ...
-                       'SOC 平均值: %.1f%%\n' ...
-                       'SOC 范围: %.1f%% - %.1f%%\n' ...
-                       'SOC 标准差: %.1f%%\n\n' ...
-                       'SOH 平均值: %.1f%%\n' ...
-                       'SOH 最小值: %.1f%%\n' ...
-                       '累积衰减: %.2f%%\n\n' ...
-                       '最大充电功率: %.1f kW\n' ...
-                       '最大放电功率: %.1f kW'], ...
+    text_str = sprintf(['Battery statistics:\n\n' ...
+                       'SOC mean: %.1f%%\n' ...
+                       'SOC range: %.1f%% - %.1f%%\n' ...
+                       'SOC std: %.1f%%\n\n' ...
+                       'SOH mean: %.1f%%\n' ...
+                       'SOH min: %.1f%%\n' ...
+                       'Cumulative degradation: %.2f%%\n\n' ...
+                       'Max charge power: %.1f kW\n' ...
+                       'Max discharge power: %.1f kW'], ...
                        avg_soc, min_soc, max_soc, std_soc, ...
                        avg_soh, min_soh, degradation, ...
                        max_charge, max_discharge);
@@ -2100,7 +2136,7 @@ function fig = plot_fig_A_overview(opts, tt, touDef)
     ax = axes(fig); hold(ax, 'on');
     n = min(24, height(tt));
     if n < 2
-        axis(ax, 'off'); text(0.5,0.5,'数据不足','Units','normalized','HorizontalAlignment','center'); return; 
+        axis(ax, 'off'); text(0.5,0.5,'Insufficient data','Units','normalized','HorizontalAlignment','center'); return; 
     end
     t = (1:n)';
     viz_tou_shading(ax, touDef);
@@ -2129,14 +2165,14 @@ function fig = plot_fig_B_battery(opts, tt)
     fig = make_figure('Fig B: Battery Power and SOC', opts.showFigures, [100, 100, 1200, 600]);
     tiledlayout(fig, 2, 1, 'TileSpacing','compact', 'Padding','compact');
     n = min(24, height(tt)); t = (1:n)';
-    % 上: 充/放电双向柱
+    % Charge/discharge bidirectional
     ax1 = nexttile; hold(ax1, 'on');
     p = tt.Battery_Power(1:n);
     bar(ax1, t, max(p,0), 0.9, 'FaceColor', [0.3,0.6,0.85], 'EdgeColor','none', 'DisplayName','Charge');
     bar(ax1, t, min(p,0), 0.9, 'FaceColor', [0.9,0.4,0.4],  'EdgeColor','none', 'DisplayName','Discharge');
     yline(ax1, 0, 'k-'); ylabel(ax1, 'Power (kW)'); legend(ax1, 'Location','northwest'); grid(ax1,'on');
     title(ax1, 'Battery Charge/Discharge');
-    % 下: SOC
+    % SOC
     ax2 = nexttile; hold(ax2, 'on');
     if any(strcmp('Battery_SOC', tt.Properties.VariableNames)) && any(~isnan(tt.Battery_SOC))
         soc = tt.Battery_SOC(1:n);
@@ -2144,7 +2180,7 @@ function fig = plot_fig_B_battery(opts, tt)
         yline(ax2, [0.2 0.9], '--', 'Color', [0.5,0.5,0.5]);
         ylim(ax2, [0 1]); ylabel(ax2, 'SOC (pu)');
     else
-        axis(ax2, 'off'); text(0.5,0.5,'缺少 Battery_SOC','Units','normalized','HorizontalAlignment','center');
+        axis(ax2, 'off'); text(0.5,0.5,'Missing Battery_SOC data','Units','normalized','HorizontalAlignment','center');
     end
     xlabel(ax2, 'Hour'); grid(ax2, 'on');
 end

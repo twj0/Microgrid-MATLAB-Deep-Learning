@@ -6,6 +6,47 @@ function [agent, results] = train_model(env, initial_agent, options)
         options = struct();
     end
 
+function sched = sched_at_episode(ep, act_info)
+% 50-episode keypoint interpolation schedule for SAC hyperparameters
+ep = double(max(1, ep));
+
+% Key episodes (knots)
+K = 0:50:2000;
+% Aggressive early, decay by 1000 then flat
+hiA = 6e-4; loA = 1e-5; hiC = 9e-4; loC = 2e-5;
+s = min(K/1000, 1); cs = 0.5*(1+cos(pi*s));
+actorLR_k  = loA + (hiA - loA) .* cs;
+criticLR_k = loC + (hiC - loC) .* cs;
+
+tau_hi = 6e-3; tau_lo = 4e-4; tau_k = tau_lo + (tau_hi - tau_lo) .* cs;
+gamma_k = 0.985 - (0.985 - 0.95) .* cs;
+
+gradClip_hi = 1.0; gradClip_lo = 0.5; gradClip_k = gradClip_lo + (gradClip_hi - gradClip_lo) .* cs;
+l2_hi = 1e-4; l2_lo = 1e-5; l2_k = l2_lo + (l2_hi - l2_lo) .* cs;
+
+% Target entropy: aggressive early (-0.3*dim) -> steady (-1.2*dim) by 1000
+dim = double(act_info.Dimension(1));
+highTE = -0.3*dim; lowTE = -1.2*dim;
+TE_k = lowTE + (highTE - lowTE) .* cs;
+
+% Alpha LR: track actor/critic LR envelope
+alphaLR_k = max(1e-5, 0.5*actorLR_k);
+
+% MiniBatch: ramp 192 -> 512 by 1000, then flat
+MB_k = round(192 + (512-192)*min(K/1000,1));
+
+% Interpolate at ep
+sched.actorLR  = interp1(K, actorLR_k, ep, 'pchip');
+sched.criticLR = interp1(K, criticLR_k, ep, 'pchip');
+sched.alphaLR  = interp1(K, alphaLR_k, ep, 'pchip');
+sched.targetEntropy = interp1(K, TE_k, ep, 'pchip');
+sched.miniBatch = max(128, round(interp1(K, MB_k, ep, 'linear')));
+sched.tau   = interp1(K, tau_k, ep, 'pchip');
+sched.gamma = interp1(K, gamma_k, ep, 'linear');
+sched.gradClip = interp1(K, gradClip_k, ep, 'previous');
+sched.l2 = interp1(K, l2_k, ep, 'pchip');
+end
+
     obs_info = getObservationInfo(env);
     act_info = getActionInfo(env);
 
@@ -72,7 +113,7 @@ function [agent, results] = train_model(env, initial_agent, options)
             % Plan A: Cosine annealing via nested ResetFcn (single-train)
             baseReset = env.ResetFcn; if isempty(baseReset), baseReset = @(in) in; end
             lr_trace = [];
-            cfgLR = struct('mode','cosine','Tmax',maxEpisodes, ...
+            cfgLR = struct('mode','cosine','Tmax',min(maxEpisodes,1500), ...
                            'baseA',1e-4,'minA',1e-5, ...
                            'baseC',2e-4,'minC',2e-5);
             env.ResetFcn = @reset_with_lr;
@@ -107,13 +148,24 @@ function [agent, results] = train_model(env, initial_agent, options)
         end
         assignin('base','g_episode_num', ep);
 
-        % Compute and apply learning rates
-        lr = compute_lr(ep, cfgLR);
-        actorLR = lr.actor; criticLR = lr.critic;
-        agent = drl_set_lr(agent, actorLR, criticLR);
+        % Episode-wise schedules via 50-episode keypoint interpolation
+        sched = sched_at_episode(ep, act_info);
+        try, agent.AgentOptions.TargetSmoothFactor = sched.tau; catch, end
+        try, agent.AgentOptions.DiscountFactor    = sched.gamma; catch, end
+        actorLR = sched.actorLR; criticLR = sched.criticLR;
+        agent = drl_set_lr(agent, actorLR, criticLR, sched.gradClip, sched.l2);
+        try
+            agent.AgentOptions.EntropyWeightOptions.TargetEntropy = sched.targetEntropy;
+            agent.AgentOptions.EntropyWeightOptions.LearnRate = sched.alphaLR;
+        catch
+        end
+        try
+            agent.AgentOptions.MiniBatchSize = sched.miniBatch;
+        catch
+        end
 
         % Record learning rate trace: [episode, actorLR, criticLR]
-        lr_trace(end+1, :) = [double(ep) double(actorLR) double(criticLR)]; %#ok<AGROW>
+        lr_trace(end+1, :) = [double(ep) double(actorLR) double(criticLR)]; 
 
         % Call original ResetFcn
         in = baseReset(in);
@@ -134,6 +186,24 @@ function [agent, results] = train_model(env, initial_agent, options)
     catch ME
         fprintf('⚠ 最优结果保存失败: %s\n', ME.message);
         fprintf('  训练结果仍然有效,可继续使用\n');
+    end
+
+    % 自动导出CSV（训练停止或达到配额后）
+    try
+        % 确保导出工具在路径上（与 run_manager 同目录）
+        ensure_run_manager_on_path();
+        % 构造 best_episode_data.mat 的绝对路径
+        current_dir = fileparts(mfilename('fullpath'));
+        project_root = find_project_root(current_dir);
+        matPath = fullfile(project_root, 'results', 'best_run', 'best_episode_data.mat');
+        if isfile(matPath)
+            fprintf('\n=== 导出CSV（best_run） ===\n');
+            export_best_run_to_csv(matPath);  % 输出到 results/best_run/csv/
+        else
+            fprintf('\n⚠ 未找到best_episode_data.mat，跳过CSV导出: %s\n', matPath);
+        end
+    catch ME
+        warning(ME.identifier, 'CSV export failed: %s', ME.message);
     end
 end
 
@@ -552,16 +622,22 @@ end
 
 
 
-function agent = drl_set_lr(agent, actorLR, criticLR)
+function agent = drl_set_lr(agent, actorLR, criticLR, gradClip, l2)
 % Safely update Actor/Critic learn rates; SAC also syncs alpha LR
 try
     if isfinite(actorLR)
         a = getActor(agent);
         if ~isempty(a)
             if numel(a) > 1
-                for i = 1:numel(a), a(i).Options.LearnRate = actorLR; end
+                for i = 1:numel(a)
+                    a(i).Options.LearnRate = actorLR;
+                    try, if nargin>=4 && isfinite(gradClip), a(i).Options.GradientThreshold = gradClip; end, catch, end
+                    try, if nargin>=5 && isfinite(l2) && isprop(a(i).Options,'L2RegularizationFactor'), a(i).Options.L2RegularizationFactor = l2; end, catch, end
+                end
             else
                 a.Options.LearnRate = actorLR;
+                try, if nargin>=4 && isfinite(gradClip), a.Options.GradientThreshold = gradClip; end, catch, end
+                try, if nargin>=5 && isfinite(l2) && isprop(a.Options,'L2RegularizationFactor'), a.Options.L2RegularizationFactor = l2; end, catch, end
             end
             agent = setActor(agent, a);
         end
@@ -573,9 +649,15 @@ try
         C = getCritic(agent);
         if ~isempty(C)
             if numel(C) > 1
-                for k = 1:numel(C), C(k).Options.LearnRate = criticLR; end
+                for k = 1:numel(C)
+                    C(k).Options.LearnRate = criticLR;
+                    try, if nargin>=4 && isfinite(gradClip), C(k).Options.GradientThreshold = gradClip; end, catch, end
+                    try, if nargin>=5 && isfinite(l2) && isprop(C(k).Options,'L2RegularizationFactor'), C(k).Options.L2RegularizationFactor = l2; end, catch, end
+                end
             else
                 C.Options.LearnRate = criticLR;
+                try, if nargin>=4 && isfinite(gradClip), C.Options.GradientThreshold = gradClip; end, catch, end
+                try, if nargin>=5 && isfinite(l2) && isprop(C.Options,'L2RegularizationFactor'), C.Options.L2RegularizationFactor = l2; end, catch, end
             end
             agent = setCritic(agent, C);
         end
@@ -595,8 +677,55 @@ end
 function lr = compute_lr(ep, cfg)
 % Cosine annealing from base -> min across [1..Tmax]
 Tmax = max(1, cfg.Tmax);
-t = min((ep-1)/max(1, Tmax-1), 1);
-s = 0.5*(1 + cos(pi*t));
-lr.actor  = cfg.minA + (cfg.baseA - cfg.minA) * s;
-lr.critic = cfg.minC + (cfg.baseC - cfg.minC) * s;
+if ep <= 100
+    boostA = cfg.baseA * 4.0;
+    boostC = cfg.baseC * 3.0;
+    lr.actor  = boostA;
+    lr.critic = boostC;
+elseif ep <= 200
+    boostA = cfg.baseA * 4.0;
+    boostC = cfg.baseC * 3.0;
+    w = (double(ep) - 100) / 100;
+    lr.actor  = cfg.baseA + (boostA - cfg.baseA) * (1 - w);
+    lr.critic = cfg.baseC + (boostC - cfg.baseC) * (1 - w);
+else
+    t = min((double(ep) - 200) / max(1, double(Tmax) - 200), 1);
+    s = 0.5*(1 + cos(pi*t));
+    lr.actor  = cfg.minA + (cfg.baseA - cfg.minA) * s;
+    lr.critic = cfg.minC + (cfg.baseC - cfg.minC) * s;
+end
+end
+
+function sched = compute_sched(ep, act_info)
+% Three-phase schedule: 400–1000 linear (0→0.8), 1000–1500 logarithmic (0.8→1.0), >1500 flat
+e0 = 400; e1 = 1000; e2 = 1500; k = 9.0;
+if ep <= 100
+    p = 0.0;
+elseif ep <= 200
+    p = (double(ep) - 100) / 100;
+elseif ep < e0
+    p = 0.0;                                 % pre-phase
+elseif ep <= e1
+    t1 = (double(ep) - e0) / max(1, (e1 - e0));
+    p = 0.8 * t1;                             % linear 0→0.8
+elseif ep <= e2
+    u = (double(ep) - e1) / max(1, (e2 - e1));
+    p = 0.8 + 0.2 * (log1p(k * u) / log1p(k)); % log 0.8→1.0
+else
+    p = 1.0;                                 % flat after 1500
+end
+
+% Map phase p∈[0,1] to target entropy and alpha LR
+dim = double(act_info.Dimension(1));
+highTE = -0.3 * dim;   % more exploration
+lowTE  = -1.2 * dim;   % steady
+sched.targetEntropy = (1 - p) * highTE + p * lowTE;
+
+alphaBase = 5e-4; alphaMin = 1e-4;
+sched.alphaLR = alphaMin + (alphaBase - alphaMin) * (1 - p);
+
+% MiniBatch: linearly ramp to 512 by 1500, flat afterwards
+mb0 = 256; mb1 = 512;
+gm = min(double(ep) / e2, 1.0);
+sched.miniBatch = round(mb0 + (mb1 - mb0) * gm);
 end
